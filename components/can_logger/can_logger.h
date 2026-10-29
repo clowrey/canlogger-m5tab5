@@ -134,6 +134,36 @@ class CanLogger : public Component {
   float peak_frame_rate() const { return peak_rate_; }
   float bus_load_pct() const { return bus_load_; }
 
+  // --- details for entities and the screen (read from ESPHome's loop) ---
+  struct IdRate {
+    uint32_t id;  // bit31 = extended
+    float rate;   // frames/s over the last ID window
+  };
+  static constexpr uint8_t TOP_IDS = 5;
+  const char *bus_state() const;           // controller error state
+  uint32_t unique_ids() const { return unique_ids_; }
+  uint8_t top_id_count() const { return top_n_; }
+  const IdRate &top_id(uint8_t i) const { return top_[i]; }
+  std::string top_ids_text() const;        // "0x123 812/s, ..."
+  float buffer_fill_pct() const;           // PSRAM ring now
+  float buffer_peak_pct() const { return ring_cap_ ? 100.0f * ring_peak_.load() / ring_cap_ : 0; }
+  uint32_t staging_peak() const { return stage_peak_.load(); }
+  uint32_t staging_size() const { return stage_cap_; }
+  float sd_total_gb() const { return sd_total_mb_.load() / 1024.0f; }
+  float sd_free_gb() const;                // estimate: free at mount minus bytes written since
+  float sd_sync_max_ms() const { return sd_sync_max_us_.load() / 1000.0f; }
+  std::string segment_name() const;
+  float segment_mb() const { return seg_cur_bytes_.load() / 1048576.0f; }
+  // UDS flash progress, sniffed on diag_tx_id: the current download (0x34 .. 0x37)
+  int uds_last_service() const { return uds_last_svc_.load(); }  // -1 = none yet
+  uint32_t uds_download_addr() const { return uds_dl_addr_.load(); }
+  uint32_t uds_download_size() const { return uds_dl_size_.load(); }  // from 0x34
+  uint32_t uds_download_bytes() const { return uds_dl_bytes_.load(); }  // 0x36 data so far
+  float uds_progress_pct() const;          // NAN until a 0x34 announced a size
+  uint32_t uds_blocks() const { return uds_blocks_.load(); }
+  float flash_session_s() const;           // this or the last flash session
+  std::string uds_last_service_text() const;  // "0x36 TransferData", "-" if none
+
   // --- controls ---
   void start_capture();   // arm/begin free-run (also called from setup)
   void stop_capture();
@@ -166,6 +196,11 @@ class CanLogger : public Component {
                      void *ctx);
   static bool on_err_(twai_node_handle_t node, const twai_error_event_data_t *edata,
                       void *ctx);
+  static bool on_state_(twai_node_handle_t node, const twai_state_change_event_data_t *edata,
+                        void *ctx);
+  void count_id_(uint32_t id);     // capture task: per-ID frame counters
+  void update_id_stats_();         // ESPHome loop: unique ids + busiest ids
+  void uds_sniff_(const Record &r);  // writer task: progress of the current download
   bool pop_stage_(RawFrame &out);  // consumer (capture task)
   bool mount_sd_();                // SDMMC slot 0 + FAT, called from writer_task
   void finish_shutdown_();         // writer_task side of safe_shutdown()
@@ -226,6 +261,36 @@ class CanLogger : public Component {
   int64_t rate_t_{0};
   uint64_t rate_frames_{0}, rate_bits_{0};
   float frame_rate_{0}, peak_rate_{0}, bus_load_{0};
+
+  // bus state (on_state_ ISR), buffer high-water marks (capture task)
+  std::atomic<uint8_t> bus_state_{0};
+  std::atomic<uint32_t> ring_peak_{0}, stage_peak_{0};
+
+  // per-ID counters, written by the capture task only (plain 32-bit stores,
+  // read approximately by the loop): standard ids direct, extended ids in a
+  // small open-addressing table
+  static constexpr uint32_t EXT_SLOTS = 256;
+  uint32_t *id_counts_{nullptr};   // [2048] internal RAM
+  uint32_t *ext_ids_{nullptr};     // [EXT_SLOTS] id | bit31, 0 = empty
+  uint32_t *ext_counts_{nullptr};  // [EXT_SLOTS]
+  // ID window (ESPHome loop only)
+  uint32_t *prev_counts_{nullptr};  // [2048 + EXT_SLOTS] PSRAM
+  int64_t ids_t_{0};
+  uint32_t unique_ids_{0};
+  IdRate top_[TOP_IDS]{};
+  uint8_t top_n_{0};
+
+  // SD (writer task)
+  std::atomic<uint32_t> sd_total_mb_{0}, sd_free0_mb_{0}, sd_sync_max_us_{0};
+  std::atomic<uint32_t> seg_index_{0}, seg_cur_bytes_{0};
+  std::atomic<uint64_t> flash_written_{0};  // bytes into flash files since boot
+
+  // UDS sniffing (writer task)
+  std::atomic<int32_t> uds_last_svc_{-1};
+  std::atomic<uint32_t> uds_dl_addr_{0}, uds_dl_size_{0}, uds_dl_bytes_{0}, uds_blocks_{0};
+  std::atomic<uint32_t> sess_start_ms_{0}, sess_end_ms_{0};  // 0 = none / still open
+  uint8_t req34_[32]{};            // 0x34 request being reassembled (ISO-TP)
+  uint8_t req34_len_{0}, req34_have_{0};
 
   // producer-side pending gap flag (set when frames were lost)
   std::atomic<bool> gap_pending_{false};

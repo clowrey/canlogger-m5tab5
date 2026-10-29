@@ -3,6 +3,7 @@
 
     python tools/tab5_api.py states <tab5-ip>
     python tools/tab5_api.py states <tab5-ip> --watch 30      # print rate/load as they change
+    python tools/tab5_api.py states <tab5-ip> --all           # every entity
     python tools/tab5_api.py press  <tab5-ip> "Safe shutdown (close SD files)"
 
 The API key is read from esphome/secrets.yaml (api_encryption_key) and never printed.
@@ -53,7 +54,11 @@ async def run(args):
         print("after: ", {k: states.get(k) for k in SUMMARY})
     else:
         await asyncio.sleep(max(4, args.watch))
-        print({k: states.get(k) for k in SUMMARY})
+        if args.all:
+            for k in sorted(states):
+                print(f"  {k}: {states[k]}")
+        else:
+            print({k: states.get(k) for k in SUMMARY})
     await cli.disconnect()
 
 
@@ -64,6 +69,7 @@ def main():
     s = sub.add_parser("states")
     s.add_argument("host")
     s.add_argument("--watch", type=float, default=0, help="seconds to stream rate/load changes")
+    s.add_argument("--all", action="store_true", help="print every entity, not just the summary")
     p = sub.add_parser("press")
     p.add_argument("host")
     p.add_argument("button")

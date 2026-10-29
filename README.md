@@ -25,10 +25,26 @@ What it does:
   lost, so a capture is only trusted when the count is 0.
 - Screen and HA sensors: frames captured, frames/s (and peak), bus load %,
   overruns, bus errors, MB written, SD and flash-session state, Wi-Fi, HA link.
+  Tap the screen's header for a details page: controller state, unique IDs and
+  the 5 busiest IDs, buffer fill and high-water marks, SD space, current
+  segment, slowest sync, uptime and UDS state.
+- Live UDS flash progress, sniffed from the tester's requests: the address and
+  size `0x34` announces, data sent so far (% done), `0x36` blocks, last service
+  and session time. Shown on the screen during a flash and as HA sensors.
+- Health sensors in HA: buffer fill/peak, staging peak, SD free/size, slowest
+  sync, heap/PSRAM free, main-loop time, uptime and last reset reason.
 - Device page with login (ESPHome `web_server`), capture list at `/files`,
   downloads at `/dl?f=<name>`. HA's device card links to it ("Visit").
 - Safe shutdown (HA button, or hold the bar on screen for 2 s) closes the SD
   files before power-off; RESTART on screen resumes logging.
+
+## Home Assistant
+
+The device joins HA through the ESPHome integration. The example dashboard in
+[homeassistant/dashboard.yaml](homeassistant/dashboard.yaml) looks like this
+during a (synthetic) 2 MB flash at ~3,000 frames/s:
+
+<img src="docs/images/ha-dashboard.png" alt="Home Assistant dashboard for the Tab5 CAN logger during a 2 MB synthetic UDS flash: 40.2 % download progress, 2,977 frames/s, 66 % bus load, 0 overruns, busiest IDs, history graphs, storage and diagnostics" width="600">
 
 ## Repository
 
@@ -79,7 +95,10 @@ file's margins.
    **Last flash capture** names the file.
 4. Before pulling power: **Safe shutdown**, wait for SAFE TO POWER OFF.
 5. Get the file from the device page, `python tools/tab5_fetch.py <tab5-ip> flash`,
-   or the SD card (faster than Wi-Fi for big files).
+   or the SD card (faster than Wi-Fi for big files). The device page links to
+   the capture list at `/files`; each name downloads the file:
+
+   <img src="docs/images/web-files.png" alt="The Tab5's /files page: a list of segNNNN.canbin and flash_*.canbin capture files" width="300">
 6. Rebuild the image and cross-check:
    ```bash
    python scripts/reassemble_uds.py flash_<boot>_<ms>.canbin --tx-id 0x602 -o image.bin
@@ -112,7 +131,15 @@ ESPHome loop (priority 1)
   and PSRAM-ring overflow (SD stalled). Either adds to `CAN overruns` and sets the
   `GAP` flag on the next record that gets through.
 - The screen and HA can't hold up capture: the capture task always preempts
-  ESPHome's loop, and its per-frame extra work is two counter increments.
+  ESPHome's loop (whose longest pass, mostly redrawing the screen, is ~200-260
+  ms). Its per-frame extra work for the statistics is a few counter increments
+  (rate, bus bits, per-ID count) and a high-water compare. UDS progress is
+  worked out in the writer task, ID ranking and rates in ESPHome's loop, and the
+  SD's free space is read once at mount (FatFS's free-space scan can be slow), then
+  estimated from what's been written.
+- The bus state comes from the driver's `on_state_change` callback, not
+  `twai_node_get_info()`: with a listen-only node and no TX queue, the latter's
+  status path asserts on a null queue.
 - Measured on the desk: up to ~2,700 frames/s (8-byte frames, ~60 % bus load)
   with 0 overruns. A real flash at STmin 0 could reach ~4,000+ frames/s, still
   well within the buffers (2,048 frames in internal RAM, 16 MB in PSRAM, about

@@ -14,6 +14,7 @@
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -80,6 +81,9 @@ bool CanLogger::ring_push_(const Record &r) {
     return false;  // full: caller counts this as loss
   ring_[head & ring_mask_] = r;
   ring_head_.store(head + 1, std::memory_order_release);
+  uint32_t used = (head + 1 - tail) & ring_mask_;
+  if (used > ring_peak_.load(std::memory_order_relaxed))
+    ring_peak_.store(used, std::memory_order_relaxed);  // only this task writes it
   return true;
 }
 
@@ -152,6 +156,15 @@ IRAM_ATTR bool CanLogger::on_err_(twai_node_handle_t node,
   return false;
 }
 
+// Error state for the screen/HA. twai_node_get_info() can't be used for this:
+// with a listen-only node and tx_queue_depth 0 there is no TX queue, and its
+// status path asserts on uxQueueSpacesAvailable(NULL).
+IRAM_ATTR bool CanLogger::on_state_(twai_node_handle_t node,
+                                    const twai_state_change_event_data_t *edata, void *ctx) {
+  ((CanLogger *) ctx)->bus_state_.store((uint8_t) edata->new_sta, std::memory_order_relaxed);
+  return false;
+}
+
 // ---- setup ----------------------------------------------------------------
 void CanLogger::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Tab5 CAN logger (esp_twai node API)...");
@@ -186,6 +199,14 @@ void CanLogger::setup() {
   g_pre = (Record *) heap_caps_malloc((size_t) g_pre_cap * sizeof(Record), MALLOC_CAP_SPIRAM);
   g_pre_head = g_pre_count = 0;
 
+  // per-ID counters (capture task) in internal RAM; the loop's snapshot in PSRAM
+  id_counts_ = (uint32_t *) heap_caps_calloc(2048, sizeof(uint32_t), MALLOC_CAP_INTERNAL);
+  ext_ids_ = (uint32_t *) heap_caps_calloc(EXT_SLOTS, sizeof(uint32_t), MALLOC_CAP_INTERNAL);
+  ext_counts_ = (uint32_t *) heap_caps_calloc(EXT_SLOTS, sizeof(uint32_t), MALLOC_CAP_INTERNAL);
+  prev_counts_ = (uint32_t *) heap_caps_calloc(2048 + EXT_SLOTS, sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+  if (!id_counts_ || !ext_ids_ || !ext_counts_ || !prev_counts_)
+    ESP_LOGW(TAG, "ID statistics disabled (no memory)");  // capture is unaffected
+
   // TWAI node (on-chip), listen-only. The node driver computes bit timing from
   // the bitrate; P4 is classic CAN only (no FD).
   // With no tx_pin the controller has no output at all (IDF allows tx = -1 only
@@ -209,12 +230,14 @@ void CanLogger::setup() {
   twai_event_callbacks_t cbs = {};
   cbs.on_rx_done = &CanLogger::on_rx_;
   cbs.on_error = &CanLogger::on_err_;
+  cbs.on_state_change = &CanLogger::on_state_;
   if (twai_node_register_event_callbacks(node_, &cbs, this) != ESP_OK ||
       twai_node_enable(node_) != ESP_OK) {
     ESP_LOGE(TAG, "TWAI node enable failed");
     this->mark_failed();
     return;
   }
+  bus_state_.store(TWAI_ERROR_ACTIVE);  // enable() leaves bus-off; no callback for it
 
   epoch_us_ = 0;  // boot-relative; an ESPHome time: source can be added later
 
@@ -232,6 +255,10 @@ void CanLogger::capture_task() {
   RawFrame rf;
   for (;;) {
     bool got = false;
+    uint32_t staged = (stage_head_.load(std::memory_order_acquire) -
+                       stage_tail_.load(std::memory_order_relaxed)) & stage_mask_;
+    if (staged > stage_peak_.load(std::memory_order_relaxed))
+      stage_peak_.store(staged, std::memory_order_relaxed);
     while (pop_stage_(rf)) {
       got = true;
       if (!running_.load())
@@ -255,6 +282,7 @@ void CanLogger::capture_task() {
         if (!(rf.id & (1u << 30)))
           bits += 8u * rf.dlc;
         bits_total_.fetch_add(bits);
+        count_id_(rf.id);
       }
     }
     // fold any ISR-side staging overflow into the integrity gate
@@ -263,6 +291,31 @@ void CanLogger::capture_task() {
       overrun_total_.fetch_add(so);
     if (!got)
       vTaskDelay(1);  // ~1 tick; staging absorbs the gap
+  }
+}
+
+// One array increment for a standard id; a short probe for an extended one.
+// Extended ids beyond EXT_SLOTS distinct values are captured but not counted.
+void CanLogger::count_id_(uint32_t id) {
+  if (id_counts_ == nullptr)
+    return;
+  if (!(id & (1u << 31))) {
+    id_counts_[id & 0x7FF]++;
+    return;
+  }
+  uint32_t key = (id & 0x1FFFFFFFu) | (1u << 31);
+  uint32_t h = (key * 2654435761u) >> 24;  // 8-bit hash for 256 slots
+  for (uint32_t k = 0; k < 8; k++) {
+    uint32_t s = (h + k) & (EXT_SLOTS - 1);
+    if (ext_ids_[s] == key) {
+      ext_counts_[s]++;
+      return;
+    }
+    if (ext_ids_[s] == 0) {
+      ext_counts_[s] = 1;
+      ext_ids_[s] = key;
+      return;
+    }
   }
 }
 
@@ -296,12 +349,14 @@ void CanLogger::open_segment_() {
     g_boot_seg = seg_idx;
   }
   char path[160];
+  seg_index_.store(seg_idx);
   snprintf(path, sizeof(path), "%s/seg%04u.canbin", sd_path_.c_str(), seg_idx++);
   g_seg_file = fopen(path, "wb");
   if (g_seg_file) {
     write_header_(g_seg_file);
     sync_file(g_seg_file);
     g_seg_bytes_written = sizeof(FileHeader);
+    seg_cur_bytes_.store(g_seg_bytes_written);
     ESP_LOGI(TAG, "segment -> %s", path);
   } else {
     ESP_LOGE(TAG, "cannot open %s", path);
@@ -354,7 +409,12 @@ void CanLogger::open_flash_file_(const Record &trigger) {
     kept++;
   }
   sync_file(g_flash_file);
+  flash_written_.fetch_add(g_flash_bytes_written);
   flash_active_.store(true);
+  // new session: progress starts from this 0x34 (uds_sniff_ fills in its size)
+  sess_start_ms_.store(std::max<uint32_t>(1, (uint32_t) (trigger.ts_us / 1000)));
+  sess_end_ms_.store(0);
+  uds_blocks_.store(0);
   ESP_LOGI(TAG, "FLASH session start -> %s (pre-roll %u recs)", path, kept);
 }
 
@@ -368,13 +428,68 @@ void CanLogger::close_flash_file_() {
   m.dlc = EV_FLASH_END;
   fwrite(&m, sizeof(m), 1, g_flash_file);
   g_flash_bytes_written += sizeof(Record);
+  flash_written_.fetch_add(sizeof(Record));
   fclose(g_flash_file);
   g_flash_file = nullptr;
   flash_active_.store(false);
+  sess_end_ms_.store(std::max<uint32_t>(1, (uint32_t) (esp_timer_get_time() / 1000)));
   last_flash_bytes_.store(g_flash_bytes_written);
   std::strncpy(g_last_flash_name, g_flash_name, sizeof(g_last_flash_name) - 1);
   g_flash_end_deadline = 0;
   ESP_LOGI(TAG, "FLASH session end: %s (%u bytes)", g_flash_name, g_flash_bytes_written);
+}
+
+// Progress of the current download, from the tester's requests only (no ECU
+// replies needed): 0x34's address and size (reassembled when it spans frames),
+// then the data length of each 0x36 from its single/first frame.
+void CanLogger::uds_sniff_(const Record &r) {
+  uint8_t pci = r.data[0] >> 4;
+  uint32_t len = 0;
+  const uint8_t *payload = nullptr;
+  uint8_t have = 0;
+  if (pci == 0x0 && r.dlc >= 2) {  // single frame
+    len = r.data[0] & 0x0F;
+    payload = &r.data[1];
+    have = std::min<uint32_t>(len, r.dlc - 1);
+  } else if (pci == 0x1 && r.dlc >= 3) {  // first frame
+    len = ((r.data[0] & 0x0F) << 8) | r.data[1];
+    payload = &r.data[2];
+    have = r.dlc - 2;
+  } else if (pci == 0x2 && req34_len_ && req34_have_ < req34_len_) {  // 0x34 continues
+    uint8_t n = std::min<uint32_t>(r.dlc - 1, req34_len_ - req34_have_);
+    std::memcpy(&req34_[req34_have_], &r.data[1], n);
+    req34_have_ += n;
+  } else {
+    return;
+  }
+  if (payload != nullptr && len > 0) {
+    uint8_t svc = payload[0];
+    uds_last_svc_.store(svc);
+    req34_len_ = 0;
+    if (svc == 0x36 && len >= 2) {
+      uds_dl_bytes_.fetch_add(len - 2);
+      uds_blocks_.fetch_add(1);
+    } else if (svc == 0x34 && len <= sizeof(req34_)) {
+      req34_len_ = len;
+      req34_have_ = std::min<uint8_t>(have, len);
+      std::memcpy(req34_, payload, req34_have_);
+    }
+  }
+  // 0x34 dataFormat, addressAndLengthFormat (high nibble size bytes, low address bytes)
+  if (req34_len_ >= 3 && req34_have_ == req34_len_) {
+    uint8_t alen = req34_[2] & 0x0F, slen = req34_[2] >> 4;
+    if (alen <= 4 && slen <= 4 && 3u + alen + slen <= req34_len_) {
+      uint32_t addr = 0, size = 0;
+      for (uint8_t i = 0; i < alen; i++)
+        addr = (addr << 8) | req34_[3 + i];
+      for (uint8_t i = 0; i < slen; i++)
+        size = (size << 8) | req34_[3 + alen + i];
+      uds_dl_addr_.store(addr);
+      uds_dl_size_.store(size);
+      uds_dl_bytes_.store(0);
+    }
+    req34_len_ = 0;
+  }
 }
 
 // Inspect one record for UDS flash boundaries, maintain pre-roll + files.
@@ -393,12 +508,14 @@ void CanLogger::writer_handle_record_(const Record &r) {
       // begin post-roll: keep writing until deadline
       g_flash_end_deadline = r.ts_us + (uint64_t) postroll_ms_ * 1000ull;
     }
+    uds_sniff_(r);
   }
 
   // write to free-run segment
   if (g_seg_file) {
     fwrite(&r, sizeof(Record), 1, g_seg_file);
     g_seg_bytes_written += sizeof(Record);
+    seg_cur_bytes_.store(g_seg_bytes_written);
     bytes_written_.fetch_add(sizeof(Record));
     if (g_seg_bytes_written >= seg_bytes_) {
       close_segment_();
@@ -410,6 +527,7 @@ void CanLogger::writer_handle_record_(const Record &r) {
   if (g_flash_file) {
     fwrite(&r, sizeof(Record), 1, g_flash_file);
     g_flash_bytes_written += sizeof(Record);
+    flash_written_.fetch_add(sizeof(Record));
     if (g_flash_end_deadline && r.ts_us >= g_flash_end_deadline)
       close_flash_file_();
   }
@@ -467,6 +585,14 @@ bool CanLogger::mount_sd_() {
   }
   ESP_LOGI(TAG, "SD mounted at %s: %s, %llu MB", sd_path_.c_str(), card->cid.name,
            (unsigned long long) card->csd.capacity * card->csd.sector_size / (1024 * 1024));
+  // Free space once, here: f_getfree can scan the whole FAT, so it never runs
+  // while capturing; sd_free_gb() subtracts what's been written since.
+  uint64_t total = 0, free = 0;
+  if (esp_vfs_fat_info(sd_path_.c_str(), &total, &free) == ESP_OK) {
+    sd_total_mb_.store((uint32_t) (total >> 20));
+    sd_free0_mb_.store((uint32_t) (free >> 20));
+    ESP_LOGI(TAG, "SD: %u MB free of %u MB", sd_free0_mb_.load(), sd_total_mb_.load());
+  }
   return true;
 }
 
@@ -521,6 +647,9 @@ void CanLogger::writer_task() {
     if (now - last_sync >= 1000000) {
       sync_file(g_seg_file);
       sync_file(g_flash_file);
+      uint32_t took = (uint32_t) (esp_timer_get_time() - now);  // slow card = ring fills
+      if (took > sd_sync_max_us_.load())
+        sd_sync_max_us_.store(took);
       last_sync = now;
     }
     if (got) {
@@ -546,6 +675,135 @@ void CanLogger::start_capture() {
 void CanLogger::stop_capture() { running_.store(false); }
 
 std::string CanLogger::last_flash_file() const { return std::string(g_last_flash_name); }
+
+// ---- details (ESPHome loop) -----------------------------------------------
+// Every 2 s: distinct ids seen since boot and the busiest ids over the window.
+// Reads the capture task's counters without locking: a count can be one frame
+// stale, which doesn't matter for a rate.
+void CanLogger::update_id_stats_() {
+  int64_t now = esp_timer_get_time();
+  if (id_counts_ == nullptr || prev_counts_ == nullptr) {
+    ids_t_ = now;
+    return;
+  }
+  float dt = ids_t_ ? (now - ids_t_) / 1e6f : 0;
+  IdRate top[TOP_IDS] = {};
+  uint8_t n = 0;
+  uint32_t uniq = 0;
+  auto consider = [&](uint32_t id, uint32_t count, uint32_t &prev) {
+    uniq++;
+    uint32_t d = count - prev;
+    prev = count;
+    if (dt <= 0 || d == 0)
+      return;
+    float rate = d / dt;
+    uint8_t pos = n < TOP_IDS ? n : TOP_IDS;
+    while (pos > 0 && top[pos - 1].rate < rate)
+      pos--;
+    if (pos >= TOP_IDS)
+      return;
+    for (uint8_t j = (n < TOP_IDS ? n : TOP_IDS - 1); j > pos; j--)
+      top[j] = top[j - 1];
+    top[pos] = {id, rate};
+    if (n < TOP_IDS)
+      n++;
+  };
+  for (uint32_t i = 0; i < 2048; i++)
+    if (id_counts_[i])
+      consider(i, id_counts_[i], prev_counts_[i]);
+  for (uint32_t s = 0; s < EXT_SLOTS; s++)
+    if (ext_ids_[s])
+      consider(ext_ids_[s], ext_counts_[s], prev_counts_[2048 + s]);
+  std::memcpy(top_, top, sizeof(top));
+  top_n_ = n;
+  unique_ids_ = uniq;
+  ids_t_ = now;
+}
+
+std::string CanLogger::top_ids_text() const {
+  std::string s;
+  char b[32];
+  for (uint8_t i = 0; i < top_n_; i++) {
+    bool ext = top_[i].id & (1u << 31);
+    snprintf(b, sizeof(b), ext ? "%s0x%08X %.0f/s" : "%s0x%03X %.0f/s", i ? ", " : "",
+             (unsigned) (top_[i].id & 0x1FFFFFFFu), top_[i].rate);
+    s += b;
+  }
+  return s.empty() ? "-" : s;
+}
+
+const char *CanLogger::bus_state() const {
+  switch (bus_state_.load()) {
+    case TWAI_ERROR_ACTIVE: return "active";
+    case TWAI_ERROR_WARNING: return "warning";
+    case TWAI_ERROR_PASSIVE: return "passive";
+    case TWAI_ERROR_BUS_OFF: return "bus-off";
+    default: return "?";
+  }
+}
+
+float CanLogger::buffer_fill_pct() const {
+  if (ring_cap_ == 0)
+    return 0;
+  uint32_t used = (ring_head_.load() - ring_tail_.load()) & ring_mask_;
+  return 100.0f * used / ring_cap_;
+}
+
+float CanLogger::sd_free_gb() const {
+  uint64_t written = bytes_written_.load() + flash_written_.load();
+  uint64_t free = (uint64_t) sd_free0_mb_.load() << 20;
+  return written >= free ? 0 : (free - written) / 1073741824.0f;
+}
+
+std::string CanLogger::segment_name() const {
+  if (!sd_ok_.load())
+    return "-";
+  char b[24];
+  snprintf(b, sizeof(b), "seg%04u.canbin", (unsigned) seg_index_.load());
+  return b;
+}
+
+float CanLogger::uds_progress_pct() const {
+  uint32_t size = uds_dl_size_.load();
+  if (size == 0)
+    return NAN;
+  return std::min(100.0f, 100.0f * uds_dl_bytes_.load() / size);
+}
+
+std::string CanLogger::uds_last_service_text() const {
+  int svc = uds_last_svc_.load();
+  if (svc < 0)
+    return "-";
+  const char *name = "";
+  switch (svc) {
+    case 0x10: name = " SessionControl"; break;
+    case 0x11: name = " ECUReset"; break;
+    case 0x14: name = " ClearDTC"; break;
+    case 0x19: name = " ReadDTC"; break;
+    case 0x22: name = " ReadDataByID"; break;
+    case 0x27: name = " SecurityAccess"; break;
+    case 0x28: name = " CommControl"; break;
+    case 0x2E: name = " WriteDataByID"; break;
+    case 0x31: name = " RoutineControl"; break;
+    case 0x34: name = " RequestDownload"; break;
+    case 0x35: name = " RequestUpload"; break;
+    case 0x36: name = " TransferData"; break;
+    case 0x37: name = " TransferExit"; break;
+    case 0x3E: name = " TesterPresent"; break;
+    case 0x85: name = " ControlDTCSetting"; break;
+  }
+  char b[40];
+  snprintf(b, sizeof(b), "0x%02X%s", svc, name);
+  return b;
+}
+
+float CanLogger::flash_session_s() const {
+  uint32_t start = sess_start_ms_.load(), end = sess_end_ms_.load();
+  if (start == 0)
+    return 0;
+  uint32_t stop = end ? end : (uint32_t) (esp_timer_get_time() / 1000);
+  return stop > start ? (stop - start) / 1000.0f : 0;
+}
 
 // ---- HTTP file server -----------------------------------------------------
 static esp_err_t http_index(httpd_req_t *req) {
@@ -633,6 +891,8 @@ void CanLogger::loop() {
     rate_frames_ = f;
     rate_bits_ = b;
   }
+  if (ids_t_ == 0 || now - ids_t_ >= 2000000)
+    update_id_stats_();
 
   // start the standalone HTTP server once, after the C6/WiFi link is up
   if (!use_web_ && g_httpd == nullptr && network_is_connected_hint_()) {

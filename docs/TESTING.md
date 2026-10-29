@@ -73,10 +73,15 @@ then traffic for longer than the post-roll. It saves the image it sent as
 - `compare_logs.py slice` says CONTIGUOUS, with one `0x34` frame, starting about
   `preroll_ms` before `0x34` and ending about `postroll_ms` after `0x37`.
 
-## 3. Screen and rate under load
+## 3. Screen, details and rate under load
 
 Run section 1's `--full` sender with `states --watch` and look at the screen:
-frames/s and bus load update once a second, overruns stay 0.
+frames/s and bus load update once a second, overruns stay 0. Tap the header
+for the details page. `tools/tab5_api.py states <tab5-ip> --all` prints every
+entity (unique IDs, busiest IDs, buffers, SD, UDS progress, health).
+
+Only one program can hold the CANable at a time; a second one stops with
+"CANable is busy".
 
 ## Results (2026-10-28, ESPHome 2026.7.2, firmware from this repo)
 
@@ -87,11 +92,14 @@ frames/s and bus load update once a second, overruns stay 0.
 | 60,000 eight-byte at 2,555-2,766 frames/s (57-61 % bus), screen redrawing | All counted, 0 overruns; rate and load shown live |
 | Synthetic flash, 20 KB image in 20 blocks | Rebuilt image byte-identical (SHA-256), size MATCH; carve CONTIGUOUS from 5.00 s before `0x34` to 1.99 s after `0x37` |
 
+| With the details/health additions: 60,000 eight-byte at ~2,700 frames/s, then 20,000 mixed | 80,000 captured, 0 overruns; unique IDs 1,031 (the sender's 1,024 standard + 7 extended); PSRAM ring peak 0.006 %, staging peak 8 of 2,048 |
+| Synthetic flash, 500 KB image in 500 blocks, ~2,900 frames/s / 64 % load during transfer | HA showed live progress (67 % mid-way); final 512,000/512,000 B, 500 blocks, 100 %; 0 overruns over 154,557 frames; rebuilt image byte-identical; carve CONTIGUOUS, one `0x34`, ends 2.00 s after `0x37` |
+
 The flash test found two carving bugs, now fixed: the `0x34` trigger frame was
 written twice, and the pre-roll was limited only by frame count, so on a quiet
 bus it reached back ~30 minutes.
 
-Not yet tested: above ~60 % bus load (the CANable sends about 2,500-2,700
+Not yet tested: above ~65 % bus load (the CANable sends about 2,500-2,700
 frames/s at most; more than 32 frames in flight makes it drop its own read-back
 copies), the CANable logging someone else's traffic at high load, and a real
 ECU flash.

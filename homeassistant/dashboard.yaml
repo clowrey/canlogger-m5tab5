@@ -36,22 +36,61 @@ views:
             entity: sensor.tab5_can_logger_can_overruns
             name: Overruns
           - type: tile
-            entity: sensor.tab5_can_logger_can_bus_errors
-            name: Bus errors
-          - type: tile
-            entity: sensor.tab5_can_logger_capture_mb_written
-            name: Written
-          - type: tile
             entity: sensor.tab5_can_logger_can_frame_rate
             name: Frame rate
           - type: tile
             entity: sensor.tab5_can_logger_can_bus_load
             name: Bus load
+          - type: tile
+            entity: sensor.tab5_can_logger_capture_mb_written
+            name: Written
+          - type: tile
+            entity: sensor.tab5_can_logger_buffer_fill
+            name: Buffer fill
       - type: grid
         cards:
           - type: heading
-            heading: Flash capture
+            heading: UDS flash
             heading_style: title
+          - type: conditional        # progress is unknown until a 0x34 announces a size
+            conditions:
+              - condition: state
+                entity: sensor.tab5_can_logger_uds_progress
+                state_not: unknown
+              - condition: state
+                entity: sensor.tab5_can_logger_uds_progress
+                state_not: unavailable
+            grid_options:
+              columns: 12
+            card:
+              type: gauge
+              entity: sensor.tab5_can_logger_uds_progress
+              name: Download progress
+              min: 0
+              max: 100
+              needle: false
+          - type: tile
+            entity: sensor.tab5_can_logger_uds_last_service
+            name: Last service
+            grid_options:
+              columns: 12
+          - type: tile
+            entity: sensor.tab5_can_logger_uds_data_sent
+            name: Data sent
+          - type: tile
+            entity: sensor.tab5_can_logger_uds_download_size
+            name: Download size
+          - type: tile
+            entity: sensor.tab5_can_logger_uds_blocks
+            name: Blocks
+          - type: tile
+            entity: sensor.tab5_can_logger_flash_session_duration
+            name: Session time
+          - type: tile
+            entity: sensor.tab5_can_logger_uds_download_address
+            name: Address
+            grid_options:
+              columns: 12
           - type: tile
             entity: sensor.tab5_can_logger_last_flash_capture
             name: Last flash file
@@ -59,7 +98,7 @@ views:
               columns: 12
           - type: tile
             entity: sensor.tab5_can_logger_last_flash_file_bytes
-            name: Last flash size
+            name: Last flash file size
             grid_options:
               columns: 12
           - type: markdown
@@ -119,16 +158,34 @@ views:
       - type: grid
         cards:
           - type: heading
-            heading: History
+            heading: Bus
             heading_style: title
-          - type: history-graph
-            title: Frames and data written
-            hours_to_show: 24
+          - type: tile
+            entity: sensor.tab5_can_logger_can_bus_state
+            name: Controller state
+          - type: tile
+            entity: sensor.tab5_can_logger_can_bus_errors
+            name: Bus errors
+          - type: tile
+            entity: sensor.tab5_can_logger_can_unique_ids
+            name: Unique IDs
             grid_options:
               columns: 12
-            entities:
-              - sensor.tab5_can_logger_can_frames_captured
-              - sensor.tab5_can_logger_capture_mb_written
+          - type: markdown
+            grid_options:
+              columns: 12
+            content: |-
+              **Busiest IDs** (frames/s, last 2 s)
+              {% set t = states('sensor.tab5_can_logger_top_can_ids') %}
+              {% if t in ['-', '', 'unknown', 'unavailable'] %}no traffic{% else %}
+              {% for x in t.split(', ') %}
+              - `{{ x }}`
+              {% endfor %}{% endif %}
+      - type: grid
+        cards:
+          - type: heading
+            heading: History
+            heading_style: title
           - type: history-graph
             title: Frame rate and bus load
             hours_to_show: 24
@@ -138,6 +195,14 @@ views:
               - sensor.tab5_can_logger_can_frame_rate
               - sensor.tab5_can_logger_can_bus_load
           - type: history-graph
+            title: Frames and data written
+            hours_to_show: 24
+            grid_options:
+              columns: 12
+            entities:
+              - sensor.tab5_can_logger_can_frames_captured
+              - sensor.tab5_can_logger_capture_mb_written
+          - type: history-graph
             title: Overruns and bus errors
             hours_to_show: 24
             grid_options:
@@ -145,6 +210,35 @@ views:
             entities:
               - sensor.tab5_can_logger_can_overruns
               - sensor.tab5_can_logger_can_bus_errors
+          - type: history-graph
+            title: Buffer fill
+            hours_to_show: 24
+            grid_options:
+              columns: 12
+            entities:
+              - sensor.tab5_can_logger_buffer_fill
+      - type: grid
+        cards:
+          - type: heading
+            heading: Storage
+            heading_style: title
+          - type: tile
+            entity: sensor.tab5_can_logger_sd_free
+            name: SD free
+          - type: tile
+            entity: sensor.tab5_can_logger_sd_size
+            name: SD size
+          - type: tile
+            entity: sensor.tab5_can_logger_current_segment
+            name: Current segment
+          - type: tile
+            entity: sensor.tab5_can_logger_segment_size
+            name: Segment size
+          - type: tile
+            entity: sensor.tab5_can_logger_sd_slowest_sync
+            name: Slowest sync
+            grid_options:
+              columns: 12
       - type: grid
         cards:
           - type: heading
@@ -156,6 +250,12 @@ views:
           - type: tile
             entity: sensor.tab5_can_logger_ip_address
             name: IP address
+          - type: tile
+            entity: sensor.tab5_can_logger_uptime
+            name: Uptime
+          - type: tile
+            entity: sensor.tab5_can_logger_reset_reason
+            name: Last reset
           - type: tile
             entity: light.tab5_can_logger_display_backlight
             name: Backlight
@@ -178,3 +278,25 @@ views:
                 name: Port A 5 V (powers the CAN unit)
               - entity: switch.tab5_can_logger_charge_enable
                 name: Battery charging
+      - type: grid
+        cards:
+          - type: heading
+            heading: Diagnostics
+            heading_style: title
+          - type: tile
+            entity: sensor.tab5_can_logger_buffer_peak
+            name: Buffer peak
+          - type: tile
+            entity: sensor.tab5_can_logger_staging_peak
+            name: Staging peak
+          - type: tile
+            entity: sensor.tab5_can_logger_heap_free
+            name: Heap free
+          - type: tile
+            entity: sensor.tab5_can_logger_psram_free
+            name: PSRAM free
+          - type: tile
+            entity: sensor.tab5_can_logger_loop_time
+            name: Loop time
+            grid_options:
+              columns: 12

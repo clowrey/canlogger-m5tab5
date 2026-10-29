@@ -75,7 +75,15 @@ def find_gs_usb():
     backend = libusb_package.get_libusb1_backend()
     libusb1.get_backend = lambda *a, **k: backend
     devs = GsUsb.scan()
-    return devs[0] if devs else None
+    if not devs:
+        return None
+    try:
+        devs[0].device_capability  # first control transfer opens the device
+    except Exception as e:  # usb.core.USBError
+        if getattr(e, "errno", None) == 13 or "Access denied" in str(e):
+            sys.exit("CANable is busy: another program (another canable_* script?) has it open")
+        raise
+    return devs[0]
 
 
 def set_bitrate(dev, bitrate, sample_point=0.875):

@@ -104,6 +104,9 @@ api:
   encryption:
     key: !secret api_encryption_key
 
+debug:
+  update_interval: 30s
+
 # Device page on port 80. HA's device card links here ("Visit"). can_logger adds
 # /files (capture list) and /dl?f= (download) to it, behind the same login.
 web_server:
@@ -232,6 +235,117 @@ sensor:
     accuracy_decimals: 0
     update_interval: 5s
     lambda: "return id(canlog).bus_load_pct();"
+  - platform: template
+    name: "CAN unique IDs"        # distinct ids since boot
+    unit_of_measurement: ids
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: "return id(canlog).unique_ids();"
+  # how close capture is to losing frames: buffer fill now and its high-water mark
+  - platform: template
+    name: "Buffer fill"
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: "return id(canlog).buffer_fill_pct();"
+  - platform: template
+    name: "Buffer peak"
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: "return id(canlog).buffer_peak_pct();"
+  - platform: template
+    name: "Staging peak"          # of the 2048-frame internal-RAM ring the ISR fills
+    unit_of_measurement: frames
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: "return id(canlog).staging_peak();"
+  - platform: template
+    name: "SD free"               # free at mount minus what's been written since
+    unit_of_measurement: GiB
+    device_class: data_size
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 60s
+    lambda: "return id(canlog).sd_free_gb();"
+  - platform: template
+    name: "SD size"
+    unit_of_measurement: GiB
+    device_class: data_size
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s          # 0 until the card has mounted
+    lambda: "return id(canlog).sd_total_gb();"
+  - platform: template
+    name: "SD slowest sync"       # longest once-a-second fsync since boot
+    unit_of_measurement: ms
+    state_class: measurement
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: "return id(canlog).sd_sync_max_ms();"
+  - platform: template
+    name: "Segment size"
+    unit_of_measurement: MiB
+    device_class: data_size
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: "return id(canlog).segment_mb();"
+  # UDS flash progress (tester requests on diag_tx_id)
+  - platform: template
+    name: "UDS progress"          # of the size the last 0x34 announced
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: "return id(canlog).uds_progress_pct();"
+  - platform: template
+    name: "UDS data sent"
+    unit_of_measurement: B
+    device_class: data_size
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return id(canlog).uds_download_bytes();"
+  - platform: template
+    name: "UDS download size"
+    unit_of_measurement: B
+    device_class: data_size
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: "return id(canlog).uds_download_size();"
+  - platform: template
+    name: "UDS blocks"            # 0x36 TransferData requests this session
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return id(canlog).uds_blocks();"
+  - platform: template
+    name: "Flash session duration"
+    unit_of_measurement: s
+    device_class: duration
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return id(canlog).flash_session_s();"
+  - platform: uptime
+    id: uptime_s
+    name: "Uptime"
+    update_interval: 60s
+  # system health (ESPHome debug component)
+  - platform: debug
+    free:
+      name: "Heap free"
+    psram:
+      name: "PSRAM free"
+    loop_time:
+      name: "Loop time"          # longest ESPHome main-loop pass (screen, API, web)
   - platform: wifi_signal
     id: wifi_rssi
     name: "WiFi Signal"
@@ -272,6 +386,23 @@ binary_sensor:
             then:
               - lambda: "id(canlog).safe_shutdown();"
               - component.update: tab5_display
+  - platform: touchscreen        # tap the header: status page <-> details page
+    id: page_button
+    touchscreen_id: touch
+    x_min: 0
+    x_max: 720
+    y_min: 0
+    y_max: 220
+    on_click:
+      min_length: 50ms
+      max_length: 1s
+      then:
+        - if:
+            condition:
+              lambda: "return !id(canlog).shutdown_requested();"
+            then:
+              - lambda: "id(display_page) = 1 - id(display_page);"
+              - component.update: tab5_display
   - platform: touchscreen
     id: restart_button
     touchscreen_id: touch
@@ -302,16 +433,48 @@ button:
     name: "Restart"
 
 text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset reason"       # why the last restart happened (power-on, OTA, crash...)
   - platform: template
     name: "Last flash capture"     # changes when a session closes -> HA automation hook
     update_interval: 5s
     lambda: "return id(canlog).last_flash_file();"
+  - platform: template
+    name: "CAN bus state"          # active / warning / passive / bus-off
+    update_interval: 10s
+    lambda: "return std::string(id(canlog).bus_state());"
+  - platform: template
+    name: "Top CAN IDs"            # busiest ids over the last 2 s
+    update_interval: 10s
+    lambda: "return id(canlog).top_ids_text();"
+  - platform: template
+    name: "Current segment"
+    update_interval: 30s
+    lambda: "return id(canlog).segment_name();"
+  - platform: template
+    name: "UDS last service"
+    update_interval: 5s
+    lambda: "return id(canlog).uds_last_service_text();"
+  - platform: template
+    name: "UDS download address"
+    update_interval: 10s
+    lambda: |-
+      if (id(canlog).uds_download_size() == 0) return std::string("-");
+      char b[16];
+      snprintf(b, sizeof(b), "0x%08X", (unsigned) id(canlog).uds_download_addr());
+      return std::string(b);
   - platform: wifi_info
     ip_address:
       id: ip_addr
       name: "IP Address"
 
-# ---- display: logger status page -------------------------------------------
+# ---- display: status page and details page ----------------------------------
+globals:
+  - id: display_page             # 0 = status, 1 = details
+    type: int
+    initial_value: "0"
+
 output:
   - platform: ledc
     pin: GPIO22
@@ -381,8 +544,12 @@ display:
         return;
       }
 
+      // header (both pages); tapping it switches page (touch region page_button 0..220)
+      const bool details = id(display_page) == 1;
       int y = 40;
       it.print(30, y, id(font_mid), fg, "TAB5 CAN LOGGER");
+      it.print(690, y + 10, id(font_small), dim, TextAlign::TOP_RIGHT,
+               details ? "< status" : "details >");
       y += 60;
       it.printf(30, y, id(font_small), dim, "%s   500 kbit/s listen-only",
                 id(ip_addr).state.empty() ? "no IP" : id(ip_addr).state.c_str());
@@ -399,13 +566,72 @@ display:
                 api::global_api_server->is_connected_with_state_subscription();
       it.print(420, y, id(font_mid), ha ? ok : warn, ha ? "HA  OK" : "HA  --");
       y += 80;
+      char b[64], l[48];
+
+      if (details) {
+        // ---- details page: small label, then lines in the mid font ----
+        auto label = [&](const char *t) { it.print(30, y, id(font_small), dim, t); y += 38; };
+        auto line = [&](Color c, const char *t) { it.print(30, y, id(font_mid), c, t); y += 50; };
+
+        const char *st = id(canlog).bus_state();
+        label("CAN BUS");
+        snprintf(b, sizeof(b), "%-8s %u ids seen", st, (unsigned) id(canlog).unique_ids());
+        line(strcmp(st, "active") == 0 ? ok : (strcmp(st, "warning") == 0 ? warn : bad), b);
+        y += 12;
+
+        label("BUSIEST IDS          frames/s");
+        uint8_t n = id(canlog).top_id_count();
+        for (uint8_t i = 0; i < 5; i++) {
+          if (i < n) {
+            const auto &t = id(canlog).top_id(i);
+            if (t.id & (1u << 31))
+              snprintf(b, sizeof(b), "%08X  %8.0f", (unsigned) (t.id & 0x1FFFFFFFu), t.rate);
+            else
+              snprintf(b, sizeof(b), "     %03X  %8.0f", (unsigned) t.id, t.rate);
+            line(fg, b);
+          } else {
+            line(dim, i == 0 ? "no traffic" : "");
+          }
+        }
+        y += 12;
+
+        label("BUFFERS");
+        snprintf(b, sizeof(b), "PSRAM %.1f%%  peak %.1f%%", id(canlog).buffer_fill_pct(),
+                 id(canlog).buffer_peak_pct());
+        line(id(canlog).buffer_peak_pct() < 50 ? fg : warn, b);
+        snprintf(b, sizeof(b), "staging peak %u/%u", (unsigned) id(canlog).staging_peak(),
+                 (unsigned) id(canlog).staging_size());
+        line(id(canlog).staging_peak() < id(canlog).staging_size() / 2 ? fg : warn, b);
+        y += 12;
+
+        label("SD CARD");
+        snprintf(b, sizeof(b), "%.1f GB free of %.1f", id(canlog).sd_free_gb(), id(canlog).sd_total_gb());
+        line(id(canlog).sd_free_gb() > 1 ? fg : warn, b);
+        snprintf(b, sizeof(b), "%s  %.1f MB", id(canlog).segment_name().c_str(), id(canlog).segment_mb());
+        line(fg, b);
+        float up = id(uptime_s).state;
+        int h = std::isnan(up) ? 0 : (int) up / 3600, m = std::isnan(up) ? 0 : ((int) up / 60) % 60;
+        snprintf(b, sizeof(b), "slowest sync %.0f ms   up %dh%02dm", id(canlog).sd_sync_max_ms(), h, m);
+        it.print(30, y, id(font_small), dim, b);
+        y += 50;
+
+        snprintf(l, sizeof(l), "UDS  last %s", id(canlog).uds_last_service_text().c_str());
+        label(l);
+        float pct = id(canlog).uds_progress_pct();
+        if (std::isnan(pct))
+          snprintf(b, sizeof(b), "--  %u blk  %.0f s", (unsigned) id(canlog).uds_blocks(),
+                   id(canlog).flash_session_s());
+        else
+          snprintf(b, sizeof(b), "%.0f%%  %u blk  %.0f s", pct, (unsigned) id(canlog).uds_blocks(),
+                   id(canlog).flash_session_s());
+        line(id(canlog).flash_active() ? warn : dim, b);
+      } else {
 
       // a cell is a small label over a big value; x = 30 (left) or 390 (right column)
       auto cell = [&](int x, const char *label, const char *value, Color c) {
         it.print(x, y, id(font_small), dim, label);
         it.print(x, y + 38, id(font_big), c, value);
       };
-      char b[64], l[48];
       snprintf(b, sizeof(b), "%llu", (unsigned long long) id(canlog).frames_total());
       cell(30, "FRAMES CAPTURED", b, fg);
       y += 160;
@@ -429,11 +655,23 @@ display:
       it.print(30, y, id(font_mid), id(canlog).sd_ok() ? ok : bad,
                id(canlog).sd_ok() ? "SD  OK" : "SD  NOT MOUNTED");
       y += 70;
-      it.print(30, y, id(font_mid), id(canlog).flash_active() ? warn : dim,
-               id(canlog).flash_active() ? "UDS FLASH CAPTURING" : "no flash session");
+      if (id(canlog).flash_active()) {
+        // live progress of the current download: % of the size 0x34 announced
+        float pct = id(canlog).uds_progress_pct();
+        if (std::isnan(pct))
+          snprintf(b, sizeof(b), "UDS FLASH CAPTURING");
+        else
+          snprintf(b, sizeof(b), "UDS %.0f%%  %.2f/%.2f MB", pct,
+                   id(canlog).uds_download_bytes() / 1048576.0,
+                   id(canlog).uds_download_size() / 1048576.0);
+        it.print(30, y, id(font_mid), warn, b);
+      } else {
+        it.print(30, y, id(font_mid), dim, "no flash session");
+      }
       y += 70;
       std::string last = id(canlog).last_flash_file();
       it.printf(30, y, id(font_small), dim, "last: %s", last.empty() ? "-" : last.c_str());
+      }  // status page
 
       // touch region: shutdown_button (1100..1240)
       bool held = id(shutdown_button).state;
