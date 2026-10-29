@@ -1,0 +1,180 @@
+# Example Home Assistant dashboard for the Tab5 CAN logger (sections view).
+# Add a dashboard, open its raw configuration editor and paste this.
+# Replace <tab5-ip> with the Tab5's address. Entity ids assume the device name
+# "Tab5 CAN Logger" (prefix sensor.tab5_can_logger_...).
+title: Tab5 CAN Logger
+views:
+  - title: Tab5
+    path: tab5
+    icon: mdi:sd
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Capture
+            heading_style: title
+          - type: tile
+            entity: binary_sensor.tab5_can_logger_capture_valid_0_overruns
+            name: Capture valid
+          - type: tile
+            entity: binary_sensor.tab5_can_logger_flash_session_active
+            name: Flash session
+          - type: tile
+            entity: binary_sensor.tab5_can_logger_sd_ok
+            name: SD card
+          - type: tile
+            entity: switch.tab5_can_logger_can_capture_armed
+            name: Capture armed
+            features:
+              - type: toggle
+          - type: tile
+            entity: sensor.tab5_can_logger_can_frames_captured
+            name: Frames
+          - type: tile
+            entity: sensor.tab5_can_logger_can_overruns
+            name: Overruns
+          - type: tile
+            entity: sensor.tab5_can_logger_can_bus_errors
+            name: Bus errors
+          - type: tile
+            entity: sensor.tab5_can_logger_capture_mb_written
+            name: Written
+          - type: tile
+            entity: sensor.tab5_can_logger_can_frame_rate
+            name: Frame rate
+          - type: tile
+            entity: sensor.tab5_can_logger_can_bus_load
+            name: Bus load
+      - type: grid
+        cards:
+          - type: heading
+            heading: Flash capture
+            heading_style: title
+          - type: tile
+            entity: sensor.tab5_can_logger_last_flash_capture
+            name: Last flash file
+            grid_options:
+              columns: 12
+          - type: tile
+            entity: sensor.tab5_can_logger_last_flash_file_bytes
+            name: Last flash size
+            grid_options:
+              columns: 12
+          - type: markdown
+            grid_options:
+              columns: 12
+            content: >-
+              {% set f = states('sensor.tab5_can_logger_last_flash_capture') %}
+              **[Open capture files](http://<tab5-ip>/files)** · [Device page](http://<tab5-ip>/)
+
+
+              {% if f not in ['', 'unknown', 'unavailable'] %}Latest flash capture:
+              [{{ f }}](http://<tab5-ip>/dl?f={{ f }}){% else %}No flash session
+              captured yet.{% endif %}
+
+
+              <small>Pages use the Tab5's web_server login. Large files download
+              slowly over its Wi-Fi; for big captures, Safe shutdown and copy the SD
+              card instead.</small>
+      - type: grid
+        cards:
+          - type: heading
+            heading: Power
+            heading_style: title
+          - type: tile
+            entity: binary_sensor.tab5_can_logger_safe_to_power_off
+            name: Safe to power off
+            grid_options:
+              columns: 12
+          - type: button
+            entity: button.tab5_can_logger_safe_shutdown_close_sd_files
+            name: Safe shutdown
+            icon: mdi:power
+            show_state: false
+            tap_action:
+              action: perform-action
+              perform_action: button.press
+              target:
+                entity_id: button.tab5_can_logger_safe_shutdown_close_sd_files
+              confirmation:
+                text: Stop capture and close the SD files? Logging resumes only after Restart.
+            hold_action:
+              action: more-info
+          - type: button
+            entity: button.tab5_can_logger_restart
+            name: Restart
+            icon: mdi:restart
+            show_state: false
+            tap_action:
+              action: perform-action
+              perform_action: button.press
+              target:
+                entity_id: button.tab5_can_logger_restart
+              confirmation:
+                text: Restart the Tab5? Logging continues in a new segment.
+            hold_action:
+              action: more-info
+      - type: grid
+        cards:
+          - type: heading
+            heading: History
+            heading_style: title
+          - type: history-graph
+            title: Frames and data written
+            hours_to_show: 24
+            grid_options:
+              columns: 12
+            entities:
+              - sensor.tab5_can_logger_can_frames_captured
+              - sensor.tab5_can_logger_capture_mb_written
+          - type: history-graph
+            title: Frame rate and bus load
+            hours_to_show: 24
+            grid_options:
+              columns: 12
+            entities:
+              - sensor.tab5_can_logger_can_frame_rate
+              - sensor.tab5_can_logger_can_bus_load
+          - type: history-graph
+            title: Overruns and bus errors
+            hours_to_show: 24
+            grid_options:
+              columns: 12
+            entities:
+              - sensor.tab5_can_logger_can_overruns
+              - sensor.tab5_can_logger_can_bus_errors
+      - type: grid
+        cards:
+          - type: heading
+            heading: Device
+            heading_style: title
+          - type: tile
+            entity: sensor.tab5_can_logger_wifi_signal
+            name: Wi-Fi signal
+          - type: tile
+            entity: sensor.tab5_can_logger_ip_address
+            name: IP address
+          - type: tile
+            entity: light.tab5_can_logger_display_backlight
+            name: Backlight
+            features:
+              - type: light-brightness
+            grid_options:
+              columns: 12
+          - type: entities
+            title: Hardware
+            state_color: true
+            show_header_toggle: false   # one tap would switch all of these, Wi-Fi included
+            grid_options:
+              columns: 12
+            entities:
+              - entity: switch.tab5_can_logger_wifi_power
+                name: Wi-Fi power (off drops it from the network)
+              - entity: switch.tab5_can_logger_wifi_external_antenna
+                name: External Wi-Fi antenna
+              - entity: switch.tab5_can_logger_external_5v_power
+                name: Port A 5 V (powers the CAN unit)
+              - entity: switch.tab5_can_logger_charge_enable
+                name: Battery charging

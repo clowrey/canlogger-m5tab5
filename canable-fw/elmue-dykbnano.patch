@@ -1,0 +1,80 @@
+diff --git a/Firmware/can.c b/Firmware/can.c
+index 71f45ce..1c72023 100644
+--- a/Firmware/can.c
++++ b/Firmware/can.c
+@@ -80,6 +80,18 @@ void can_init()
+ 
+     HAL_GPIO_WritePin(CAN_TRX_ENABLE_PORT, CAN_TRX_ENABLE_PIN, CAN_TRX_ENABLE_ON);
+ #endif
++
++#if defined(CAN_VIO_ENABLE_PIN)
++    // Switch on the transceiver's IO supply, if the board switches it (DYKB nano)
++    GPIO_InitStruct.Pin       = CAN_VIO_ENABLE_PIN;
++    GPIO_InitStruct.Mode      = GPIO_MODE_OUTPUT_PP;
++    GPIO_InitStruct.Alternate = 0;
++    GPIO_InitStruct.Pull      = GPIO_NOPULL;
++    GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
++    HAL_GPIO_Init(CAN_VIO_ENABLE_PORT, &GPIO_InitStruct);
++
++    HAL_GPIO_WritePin(CAN_VIO_ENABLE_PORT, CAN_VIO_ENABLE_PIN, GPIO_PIN_SET);
++#endif
+ }
+ 
+ // called from init() and close() --> reset variable for the next can_open().
+@@ -426,7 +438,7 @@ void can_process(uint8_t channel, uint32_t tick_now)
+ 
+     // If a message hangs longer than a few milliseconds in the Tx FIFO this means that it was not acknowledged.
+     // The processor continues to send the message !!ETERNALLY!! producing a bus load of 95%.
+-    // Tx requests must be canceled by firmware to free CAN bus from the congestion.
++    // Tx requests must be canceled by firmware to free CAN bus from the congestion.
+     // the processor will never stop alone sending the same packet over and over again.
+     if (inst->tx_pending > 0 && tick_now >= inst->last_tx_tick + CAN_TX_TIMEOUT)
+     {
+@@ -937,7 +949,7 @@ bool can_using_FD(uint8_t channel)
+ {
+     return can_inst[channel].bitrate_data.Brp > 0;
+ }
+-
++
+ // true if data bitrate greater than nominal bitrate
+ bool can_using_BRS(uint8_t channel)
+ {
+diff --git a/Firmware/settings.h b/Firmware/settings.h
+index 49c4bcc..6e68f5d 100644
+--- a/Firmware/settings.h
++++ b/Firmware/settings.h
+@@ -115,6 +115,25 @@ typedef enum // sent as 8 bit
+     // -------------------
+     #define ALLOW_DISABLE_BOOT0 1  // allow to disable pin BOOT0
+ 
++#elif defined(DykbNano)
++
++    // DYKB "CANable v2.0 nano" (AliExpress): official CANable 2.0 pinout. Its factory
++    // firmware (normaldotcom canable2) also drives PA0 low (transceiver standby off)
++    // and PC13 high (transceiver IO power), so do the same.
++    // Maximum 24 characters!
++    #define ADAPTER_NAME        "DYKB CANable 2.0 nano"
++    #define LED_TX_PINS         GPIO_PIN_11
++    #define LED_TX_PORTS        GPIOB
++    #define CAN_TRX_ENABLE_PIN  GPIO_PIN_0
++    #define CAN_TRX_ENABLE_PORT GPIOA
++    #define CAN_TRX_ENABLE_ON   GPIO_PIN_RESET
++    #define CAN_VIO_ENABLE_PIN  GPIO_PIN_13
++    #define CAN_VIO_ENABLE_PORT GPIOC
++    // -------------------
++    #define MAX_CAN_BAUDRATE    5
++    // -------------------
++    #define ALLOW_DISABLE_BOOT0 1
++
+ #elif defined(OleksiiSolo)
+ 
+     // Maximum 24 characters!
+@@ -141,7 +160,7 @@ typedef enum // sent as 8 bit
+ 
+     // Oleksii puts a 8 MHz quartz on the dual channel board
+     // The board has 2 CAN connectors and creates 2 independent Candlelight USB interfaces.
+-    #define CHANNEL_COUNT       2
++    #define CHANNEL_COUNT       2
+     // ------------------------------------------------------------
+     //                          Channel 1:               Channel 2:
+     #define CAN_INTERFACES      FDCAN1,                  FDCAN2

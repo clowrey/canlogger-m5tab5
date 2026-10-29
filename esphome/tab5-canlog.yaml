@@ -1,0 +1,442 @@
+# M5Stack Tab5 (ESP32-P4, ST7123 display revision) — CAN logger.
+#
+# The capture engine is the can_logger external component in ../components
+# (see the README). ESPHome provides the HA API, OTA, logs and the C6 Wi-Fi;
+# ESPHome's own `canbus` is NOT used (it is serviced once per main loop and
+# drops frames on a busy bus).
+#
+# Hardware blocks below follow ESPHome's M5Stack-Tab5 device config. Display:
+# ESPHome's M5STACK-TAB5-ST7123 mipi_dsi model. A unit labelled ST7123 can carry
+# an ST7121; if the screen stays blank with no error, try M5STACK-TAB5-ST7121.
+#
+# CAN unit (CA-IS3050G) on Port A: yellow = G53, white = G54. M5 lists the unit
+# pins as yellow CAN_TX / white CAN_RX. No tx_pin is configured, so the TWAI
+# controller has no output and cannot drive the bus either way round; if
+# "CAN frames captured" stays 0 on a live bus, change rx_pin to GPIO53.
+#
+# Copy secrets.yaml.example to secrets.yaml (next to this file) and fill it in.
+# Build and flash:
+#   esphome run esphome/tab5-canlog.yaml                     (USB, first time)
+#   esphome run esphome/tab5-canlog.yaml --device <tab5-ip>  (OTA afterwards)
+
+substitutions:
+  name: tab5-canlog
+  friendly_name: Tab5 CAN Logger
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Panel reset, as M5's Tab5 BSP (bsp_reset_tp) does it: LCD_RST (pi4ioe1 P4)
+    # has no 1.8 V pull-up on the panel side and must never be driven to 3.3 V, so
+    # it is only ever pulled low, then released by switching it to an input with
+    # pull-up. Runs after the expander (IO, 900) and before the display (DATA,
+    # 600). delay() here blocks setup, which a YAML `delay:` would not.
+    - priority: 700
+      then:
+        - lambda: |-
+            id(pi4ioe1).digital_write(4, false);   // latch low before it becomes an output
+            id(pi4ioe1).digital_write(5, false);
+            id(pi4ioe1).pin_mode(4, gpio::FLAG_OUTPUT);
+            id(pi4ioe1).pin_mode(5, gpio::FLAG_OUTPUT);
+            delay(100);
+            id(pi4ioe1).digital_write(5, true);    // TP_RST: push-pull high is fine
+            id(pi4ioe1).pin_mode(4, gpio::Flags(gpio::FLAG_INPUT | gpio::FLAG_PULLUP));
+            delay(150);
+
+esp32:
+  variant: esp32p4
+  cpu_frequency: 360MHz   # 400MHz is flagged experimental/may not boot on P4
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    advanced:
+      enable_idf_experimental_features: true
+
+# C6 co-processor Wi-Fi over SDIO (the P4 has no radio)
+esp32_hosted:
+  variant: esp32c6
+  active_high: true
+  clk_pin: GPIO12
+  cmd_pin: GPIO13
+  d0_pin: GPIO11
+  d1_pin: GPIO10
+  d2_pin: GPIO9
+  d3_pin: GPIO8
+  reset_pin: GPIO15
+  slot: 1
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+  level: DEBUG   # INFO would compile out ESP_LOGCONFIG (dump_config)
+
+psram:
+  mode: hex
+  speed: 200MHz
+
+i2c:
+  - id: bsp_bus
+    sda: GPIO31
+    scl: GPIO32
+    frequency: 400kHz
+
+# MIPI-DSI PHY supply
+esp_ldo:
+  - voltage: 2.5V
+    channel: 3
+
+pi4ioe5v6408:
+  - id: pi4ioe1
+    address: 0x43
+    # 0: wifi antenna int/ext  1: speaker enable  2: external 5V power
+    # 4: lcd reset  5: touch reset  6: camera reset  7: headphone detect (in)
+  - id: pi4ioe2
+    address: 0x44
+    # 0: wifi power  3: usb 5V power  4: poweroff pulse
+    # 5: quick charge (inverted)  6: charging status (in)  7: charge enable
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # no fallback AP: captive_portal would answer every page on port 80
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+# Device page on port 80. HA's device card links here ("Visit"). can_logger adds
+# /files (capture list) and /dl?f= (download) to it, behind the same login.
+web_server:
+  port: 80
+  version: 3
+  local: true                  # works without internet access
+  auth:
+    username: !secret web_server_username
+    password: !secret web_server_password
+  js_include: tab5-canlog-files-link.js
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [can_logger]
+
+can_logger:
+  id: canlog
+  rx_pin: GPIO54        # Port A white = unit CAN_RX; swap to GPIO53 if no frames
+  # tx_pin deliberately omitted: listen-only with no TX output
+  bitrate: 500000
+  sd_path: /sdcard      # SDMMC slot 0, Tab5 pins/LDO are the component defaults
+  ring_mb: 16           # of 32 MB PSRAM
+  diag_tx_id: 0x602     # tester -> ECU id; 0 = detect UDS 0x34/0x37 on any id
+  preroll_ms: 5000      # history kept before a 0x34 so you catch 0x10/0x27
+  postroll_ms: 2000
+
+switch:
+  # Power rails on the IO expanders. M5's Tab5 BSP turns WLAN_PWR_EN and EXT_5V
+  # on at boot; without wifi_power the C6 never answers, and EXT_5V feeds the
+  # Port A red wire that powers the CAN unit.
+  - platform: gpio
+    id: wifi_power
+    name: "WiFi Power"
+    pin:
+      pi4ioe5v6408: pi4ioe2
+      number: 0
+    restore_mode: ALWAYS_ON
+  # RF switch: off = internal antenna, on = external MMCX. Must be driven: left
+  # alone the expander pin is Hi-Z with a weak pull-down and reception suffers.
+  - platform: gpio
+    id: wifi_antenna_int_ext
+    name: "WiFi External Antenna"
+    pin:
+      pi4ioe5v6408: pi4ioe1
+      number: 0
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    id: external_5v_power
+    name: "External 5V Power"
+    pin:
+      pi4ioe5v6408: pi4ioe1
+      number: 2
+    restore_mode: ALWAYS_ON
+  - platform: gpio
+    id: charge_enable
+    name: "Charge Enable"
+    pin:
+      pi4ioe5v6408: pi4ioe2
+      number: 7
+    restore_mode: ALWAYS_ON
+  - platform: template
+    name: "CAN capture armed"
+    optimistic: true
+    restore_mode: ALWAYS_ON
+    turn_on_action:
+      - lambda: "id(canlog).start_capture();"
+    turn_off_action:
+      - lambda: "id(canlog).stop_capture();"
+
+# ---- entities surfaced to Home Assistant ----------------------------------
+sensor:
+  - platform: template
+    name: "CAN frames captured"
+    unit_of_measurement: frames   # units + state_class make HA graph these as lines
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return (float) id(canlog).frames_total();"
+  - platform: template
+    name: "CAN overruns"          # the integrity gate: must stay 0
+    unit_of_measurement: frames
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return (float) id(canlog).overrun_total();"
+  - platform: template
+    name: "CAN bus errors"        # diagnostic (node on_error events)
+    unit_of_measurement: errors
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return (float) id(canlog).bus_errors();"
+  - platform: template
+    name: "Capture MB written"
+    unit_of_measurement: MiB
+    device_class: data_size
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: "return id(canlog).bytes_written() / 1048576.0f;"
+  - platform: template
+    name: "Last flash file bytes"
+    unit_of_measurement: B
+    device_class: data_size
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return (float) id(canlog).last_flash_bytes();"
+  - platform: template
+    name: "CAN frame rate"
+    unit_of_measurement: frames/s
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return id(canlog).frame_rate();"
+  - platform: template
+    name: "CAN bus load"          # nominal frame bits, no stuff bits: reads a little low
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return id(canlog).bus_load_pct();"
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal"
+    update_interval: 10s
+
+binary_sensor:
+  - platform: template
+    name: "SD OK"
+    lambda: "return id(canlog).sd_ok();"
+  - platform: template
+    name: "Flash session active"
+    lambda: "return id(canlog).flash_active();"
+  - platform: template
+    name: "Capture valid (0 overruns)"
+    lambda: "return id(canlog).capture_valid();"
+  - platform: template
+    name: "Safe to power off"
+    lambda: "return id(canlog).shutdown_done();"
+
+  # On-screen buttons (regions match the display lambda). Shutdown needs a
+  # 2 s hold so a brush of the screen can't stop logging.
+  - platform: touchscreen
+    id: shutdown_button
+    touchscreen_id: touch
+    x_min: 30
+    x_max: 690
+    y_min: 1100
+    y_max: 1240
+    on_state:
+      - component.update: tab5_display
+    on_click:
+      min_length: 2s
+      max_length: 30s
+      then:
+        - if:
+            condition:
+              lambda: "return !id(canlog).shutdown_requested();"
+            then:
+              - lambda: "id(canlog).safe_shutdown();"
+              - component.update: tab5_display
+  - platform: touchscreen
+    id: restart_button
+    touchscreen_id: touch
+    x_min: 160
+    x_max: 560
+    y_min: 950
+    y_max: 1080
+    on_click:
+      min_length: 50ms
+      max_length: 5s
+      then:
+        - if:
+            condition:
+              lambda: "return id(canlog).shutdown_done();"
+            then:
+              - lambda: "App.safe_reboot();"
+
+button:
+  # Stops capture, writes out the buffered frames, ends any UDS flash session
+  # file and closes the segment, so pulling power can't catch a FAT write half
+  # done. Capture only resumes after a restart.
+  - platform: template
+    name: "Safe shutdown (close SD files)"
+    icon: mdi:power-plug-off
+    on_press:
+      - lambda: "id(canlog).safe_shutdown();"
+  - platform: restart
+    name: "Restart"
+
+text_sensor:
+  - platform: template
+    name: "Last flash capture"     # changes when a session closes -> HA automation hook
+    update_interval: 5s
+    lambda: "return id(canlog).last_flash_file();"
+  - platform: wifi_info
+    ip_address:
+      id: ip_addr
+      name: "IP Address"
+
+# ---- display: logger status page -------------------------------------------
+output:
+  - platform: ledc
+    pin: GPIO22
+    id: backlight_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: backlight
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0s
+
+font:
+  - file: "gfonts://Roboto Mono@700"
+    id: font_big
+    size: 96
+  - file: "gfonts://Roboto Mono"
+    id: font_mid
+    size: 44
+  - file: "gfonts://Roboto Mono"
+    id: font_small
+    size: 30
+
+# ST7123 touch (same chip as the panel), I2C 0x55 on bsp_bus. No reset_pin: the
+# on_boot lambda already resets TP_RST (pi4ioe1 P5), and the driver's own pulse
+# would come after the panel is up. update_interval is needed: the driver
+# finishes its init in update(), then runs off the interrupt.
+touchscreen:
+  - platform: st7123
+    id: touch
+    i2c_id: bsp_bus
+    display: tab5_display
+    interrupt_pin: GPIO23
+    update_interval: 100ms
+    calibration:
+      x_min: 0
+      x_max: 720
+      y_min: 0
+      y_max: 1280
+
+display:
+  - platform: mipi_dsi
+    id: tab5_display
+    model: M5STACK-TAB5-ST7123
+    update_interval: 1s
+    auto_clear_enabled: false
+    lambda: |-
+      // portrait 720 x 1280; no rotation (rotation has crashed ST712x units)
+      const Color bg(0, 0, 0), fg(230, 230, 230), dim(120, 120, 120);
+      const Color ok(40, 200, 80), bad(230, 50, 40), warn(240, 160, 20);
+      it.fill(bg);
+
+      if (id(canlog).shutdown_requested()) {
+        bool done = id(canlog).shutdown_done();
+        it.print(360, 500, id(font_big), done ? ok : warn, TextAlign::CENTER,
+                 done ? "SAFE TO" : "CLOSING");
+        it.print(360, 620, id(font_big), done ? ok : warn, TextAlign::CENTER,
+                 done ? "POWER OFF" : "FILES...");
+        it.print(360, 780, id(font_small), dim, TextAlign::CENTER,
+                 done ? "SD files closed. Restart to resume logging." : "writing buffered frames");
+        if (done) {  // touch region: restart_button (950..1080)
+          it.filled_rectangle(160, 950, 400, 130, Color(30, 60, 120));
+          it.print(360, 1015, id(font_mid), fg, TextAlign::CENTER, "RESTART");
+        }
+        return;
+      }
+
+      int y = 40;
+      it.print(30, y, id(font_mid), fg, "TAB5 CAN LOGGER");
+      y += 60;
+      it.printf(30, y, id(font_small), dim, "%s   500 kbit/s listen-only",
+                id(ip_addr).state.empty() ? "no IP" : id(ip_addr).state.c_str());
+      y += 50;
+      float rssi = id(wifi_rssi).state;
+      if (std::isnan(rssi) || !wifi::global_wifi_component->is_connected()) {
+        it.print(30, y, id(font_mid), bad, "WiFi  down");
+      } else {
+        it.printf(30, y, id(font_mid), rssi > -67 ? ok : (rssi > -80 ? warn : bad),
+                  "WiFi  %.0f dBm", rssi);
+      }
+      // only clients that subscribe to entity states (Home Assistant), not log viewers
+      bool ha = api::global_api_server != nullptr &&
+                api::global_api_server->is_connected_with_state_subscription();
+      it.print(420, y, id(font_mid), ha ? ok : warn, ha ? "HA  OK" : "HA  --");
+      y += 80;
+
+      // a cell is a small label over a big value; x = 30 (left) or 390 (right column)
+      auto cell = [&](int x, const char *label, const char *value, Color c) {
+        it.print(x, y, id(font_small), dim, label);
+        it.print(x, y + 38, id(font_big), c, value);
+      };
+      char b[64], l[48];
+      snprintf(b, sizeof(b), "%llu", (unsigned long long) id(canlog).frames_total());
+      cell(30, "FRAMES CAPTURED", b, fg);
+      y += 160;
+      snprintf(l, sizeof(l), "FRAMES/S  peak %.0f", id(canlog).peak_frame_rate());
+      snprintf(b, sizeof(b), "%.0f", id(canlog).frame_rate());
+      cell(30, l, b, fg);
+      float load = id(canlog).bus_load_pct();
+      snprintf(b, sizeof(b), "%.0f%%", load);
+      cell(390, "BUS LOAD", b, load < 70 ? fg : (load < 90 ? warn : bad));
+      y += 160;
+      uint64_t ovr = id(canlog).overrun_total();
+      snprintf(b, sizeof(b), "%llu", (unsigned long long) ovr);
+      cell(30, "OVERRUNS", b, ovr == 0 ? ok : bad);
+      snprintf(b, sizeof(b), "%u", (unsigned) id(canlog).bus_errors());
+      cell(390, "BUS ERRORS", b, id(canlog).bus_errors() == 0 ? fg : warn);
+      y += 160;
+      snprintf(b, sizeof(b), "%.2f MB", id(canlog).bytes_written() / 1048576.0);
+      cell(30, "WRITTEN TO SD", b, fg);
+      y += 160;
+
+      it.print(30, y, id(font_mid), id(canlog).sd_ok() ? ok : bad,
+               id(canlog).sd_ok() ? "SD  OK" : "SD  NOT MOUNTED");
+      y += 70;
+      it.print(30, y, id(font_mid), id(canlog).flash_active() ? warn : dim,
+               id(canlog).flash_active() ? "UDS FLASH CAPTURING" : "no flash session");
+      y += 70;
+      std::string last = id(canlog).last_flash_file();
+      it.printf(30, y, id(font_small), dim, "last: %s", last.empty() ? "-" : last.c_str());
+
+      // touch region: shutdown_button (1100..1240)
+      bool held = id(shutdown_button).state;
+      it.filled_rectangle(30, 1100, 660, 140, held ? Color(150, 90, 0) : Color(70, 25, 25));
+      it.print(360, 1170, id(font_mid), fg, TextAlign::CENTER,
+               held ? "KEEP HOLDING..." : "HOLD 2 s: SAFE SHUTDOWN");

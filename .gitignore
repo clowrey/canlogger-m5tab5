@@ -1,0 +1,22 @@
+# credentials
+esphome/secrets.yaml
+
+# ESPHome build output
+.esphome/
+esphome/.esphome/
+
+# Python
+__pycache__/
+*.pyc
+
+# captures and logs from runs
+*.canbin
+*.log
+captures/
+*_image.bin
+*_rebuilt.bin
+
+# firmware builds and device backups
+*.dfu
+canable-fw/*.bin
+canable-fw/*.hex
