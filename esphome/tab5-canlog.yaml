@@ -43,6 +43,12 @@ esphome:
             id(pi4ioe1).digital_write(5, true);    // TP_RST: push-pull high is fine
             id(pi4ioe1).pin_mode(4, gpio::Flags(gpio::FLAG_INPUT | gpio::FLAG_PULLUP));
             delay(150);
+    # once everything is set up: backlight to the saved screen brightness
+    - priority: -100
+      then:
+        - light.turn_on:
+            id: backlight
+            brightness: !lambda "return id(screen_brightness).state / 100.0f;"
 
 esp32:
   variant: esp32p4
@@ -315,19 +321,23 @@ binary_sensor:
     name: "Safe to power off"
     lambda: "return id(canlog).shutdown_done();"
 
-  # On-screen buttons (regions match the display lambda). Shutdown needs a
-  # 2 s hold so a brush of the screen can't stop logging.
+  # On-screen buttons (regions match the display lambda). Bottom row:
+  # [DETAILS] [SAFE SHUTDOWN] [SETTINGS]. Shutdown needs a 4 s hold so a brush
+  # of the screen can't stop logging; a page button opens its page, or goes back
+  # to the status page if that page is already open.
   - platform: touchscreen
     id: shutdown_button
     touchscreen_id: touch
-    x_min: 30
-    x_max: 690
+    x_min: 220
+    x_max: 500
     y_min: 1100
     y_max: 1240
+    on_press:
+      - lambda: "id(shutdown_press_ms) = millis();"
     on_state:
       - component.update: tab5_display
     on_click:
-      min_length: 2s
+      min_length: 4s
       max_length: 30s
       then:
         - if:
@@ -336,13 +346,13 @@ binary_sensor:
             then:
               - lambda: "id(canlog).safe_shutdown();"
               - component.update: tab5_display
-  - platform: touchscreen        # tap the header: status page <-> details page
-    id: page_button
+  - platform: touchscreen
+    id: details_button
     touchscreen_id: touch
-    x_min: 0
-    x_max: 720
-    y_min: 0
-    y_max: 220
+    x_min: 30
+    x_max: 200
+    y_min: 1100
+    y_max: 1240
     on_click:
       min_length: 50ms
       max_length: 1s
@@ -351,7 +361,63 @@ binary_sensor:
             condition:
               lambda: "return !id(canlog).shutdown_requested();"
             then:
-              - lambda: "id(display_page) = 1 - id(display_page);"
+              - lambda: "id(display_page) = id(display_page) == 1 ? 0 : 1;"
+              - component.update: tab5_display
+  - platform: touchscreen
+    id: settings_button
+    touchscreen_id: touch
+    x_min: 520
+    x_max: 690
+    y_min: 1100
+    y_max: 1240
+    on_click:
+      min_length: 50ms
+      max_length: 1s
+      then:
+        - if:
+            condition:
+              lambda: "return !id(canlog).shutdown_requested();"
+            then:
+              - lambda: "id(display_page) = id(display_page) == 2 ? 0 : 2;"
+              - component.update: tab5_display
+  # settings page: brightness - and + (only while that page is shown)
+  - platform: touchscreen
+    id: brightness_down
+    touchscreen_id: touch
+    x_min: 30
+    x_max: 330
+    y_min: 620
+    y_max: 760
+    on_click:
+      min_length: 50ms
+      max_length: 1s
+      then:
+        - if:
+            condition:
+              lambda: "return id(display_page) == 2 && !id(canlog).shutdown_requested();"
+            then:
+              - number.decrement:
+                  id: screen_brightness
+                  cycle: false
+              - component.update: tab5_display
+  - platform: touchscreen
+    id: brightness_up
+    touchscreen_id: touch
+    x_min: 390
+    x_max: 690
+    y_min: 620
+    y_max: 760
+    on_click:
+      min_length: 50ms
+      max_length: 1s
+      then:
+        - if:
+            condition:
+              lambda: "return id(display_page) == 2 && !id(canlog).shutdown_requested();"
+            then:
+              - number.increment:
+                  id: screen_brightness
+                  cycle: false
               - component.update: tab5_display
   - platform: touchscreen
     id: restart_button
@@ -403,11 +469,35 @@ text_sensor:
       id: ip_addr
       name: "IP Address"
 
-# ---- display: status page and details page ----------------------------------
+# ---- display: status, details and settings pages -----------------------------
 globals:
-  - id: display_page             # 0 = status, 1 = details
+  - id: display_page             # 0 = status, 1 = details, 2 = settings
     type: int
     initial_value: "0"
+  - id: shutdown_press_ms        # when the shutdown button was pressed, for the countdown
+    type: uint32_t
+    initial_value: "0"
+
+# Screen brightness, set on the settings page or from HA, kept across restarts.
+# The backlight light follows it at boot; changing the light directly from HA
+# isn't saved.
+number:
+  - platform: template
+    id: screen_brightness
+    name: "Screen brightness"
+    icon: mdi:brightness-6
+    unit_of_measurement: "%"
+    entity_category: config
+    min_value: 10                # never fully dark: the screen is the only way to see it's logging
+    max_value: 100
+    step: 10
+    initial_value: 50
+    optimistic: true
+    restore_value: true
+    on_value:
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda "return x / 100.0f;"
 
 output:
   - platform: ledc
@@ -420,7 +510,7 @@ light:
     output: backlight_pwm
     name: "Display Backlight"
     id: backlight
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: ALWAYS_ON      # brightness comes from screen_brightness (on_boot)
     default_transition_length: 0s
 
 font:
@@ -478,12 +568,12 @@ display:
         return;
       }
 
-      // header (both pages); tapping it switches page (touch region page_button 0..220)
-      const bool details = id(display_page) == 1;
+      // header (all pages)
+      const int page = id(display_page);
       int y = 40;
       it.print(30, y, id(font_mid), fg, "TAB5 CAN LOGGER");
       it.print(690, y + 10, id(font_small), dim, TextAlign::TOP_RIGHT,
-               details ? "< status" : "details >");
+               page == 1 ? "details" : (page == 2 ? "settings" : ""));
       y += 60;
       it.printf(30, y, id(font_small), dim, "%s   500 kbit/s listen-only",
                 id(ip_addr).state.empty() ? "no IP" : id(ip_addr).state.c_str());
@@ -502,7 +592,30 @@ display:
       y += 80;
       char b[64], l[48];
 
-      if (details) {
+      if (page == 2) {
+        // ---- settings page: screen brightness (touch regions brightness_down/up 620..760) ----
+        int pct = (int) lroundf(id(screen_brightness).state);
+        it.print(30, y + 30, id(font_small), dim, "SCREEN BRIGHTNESS");
+        snprintf(b, sizeof(b), "%d%%", pct);
+        it.print(360, y + 80, id(font_big), fg, TextAlign::TOP_CENTER, b);
+        it.rectangle(30, 460, 660, 50, dim);
+        it.filled_rectangle(34, 464, 652 * pct / 100, 42, Color(30, 60, 120));
+        const Color key(45, 45, 45);
+        it.filled_rectangle(30, 620, 300, 140, pct > 10 ? key : bg);
+        it.print(180, 690, id(font_big), pct > 10 ? fg : dim, TextAlign::CENTER, "-");
+        it.filled_rectangle(390, 620, 300, 140, pct < 100 ? key : bg);
+        it.print(540, 690, id(font_big), pct < 100 ? fg : dim, TextAlign::CENTER, "+");
+        it.print(30, 800, id(font_small), dim, "Kept across restarts; also in HA");
+        it.print(30, 838, id(font_small), dim, "as \"Screen brightness\".");
+
+        it.print(30, 920, id(font_small), dim, "FIRMWARE");
+        char bt[Application::BUILD_TIME_STR_SIZE];
+        App.get_build_time_string(bt);
+        snprintf(b, sizeof(b), "ESPHome %s", ESPHOME_VERSION);
+        it.print(30, 958, id(font_small), fg, b);
+        snprintf(b, sizeof(b), "built %s", bt);
+        it.print(30, 996, id(font_small), fg, b);
+      } else if (page == 1) {
         // ---- details page: small label, then lines in the mid font ----
         auto label = [&](const char *t) { it.print(30, y, id(font_small), dim, t); y += 38; };
         auto line = [&](Color c, const char *t) { it.print(30, y, id(font_mid), c, t); y += 50; };
@@ -586,8 +699,23 @@ display:
       it.print(30, y, id(font_small), free_gb > 1 ? dim : warn, b);
       }  // status page
 
-      // touch region: shutdown_button (1100..1240)
+      // bottom row, touch regions details_button / shutdown_button / settings_button (1100..1240)
+      auto page_key = [&](int x, int p, const char *t) {
+        bool open = page == p;
+        it.filled_rectangle(x, 1100, 170, 140, open ? Color(30, 60, 120) : Color(45, 45, 45));
+        it.print(x + 85, 1170, id(font_small), fg, TextAlign::CENTER, open ? "BACK" : t);
+      };
+      page_key(30, 1, "DETAILS");
+      page_key(520, 2, "SETTINGS");
       bool held = id(shutdown_button).state;
-      it.filled_rectangle(30, 1100, 660, 140, held ? Color(150, 90, 0) : Color(70, 25, 25));
-      it.print(360, 1170, id(font_mid), fg, TextAlign::CENTER,
-               held ? "KEEP HOLDING..." : "HOLD 2 s: SAFE SHUTDOWN");
+      it.filled_rectangle(220, 1100, 280, 140, held ? Color(150, 90, 0) : Color(70, 25, 25));
+      if (held) {
+        uint32_t ms = millis() - id(shutdown_press_ms);
+        int left = ms >= 4000 ? 0 : (int) ((4000 - ms + 999) / 1000);
+        it.print(360, 1140, id(font_small), fg, TextAlign::CENTER, left ? "KEEP HOLDING" : "RELEASE");
+        snprintf(b, sizeof(b), left ? "%d s" : "to shut down", left);
+        it.print(360, 1200, id(font_small), fg, TextAlign::CENTER, b);
+      } else {
+        it.print(360, 1140, id(font_small), fg, TextAlign::CENTER, "SAFE SHUTDOWN");
+        it.print(360, 1200, id(font_small), dim, TextAlign::CENTER, "hold 4 s");
+      }

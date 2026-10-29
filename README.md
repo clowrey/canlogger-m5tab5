@@ -23,14 +23,16 @@ What it does:
 - Screen and HA sensors: frames captured, frames/s (and peak), bus load %,
   overruns, bus errors, MB written, current segment, SD state and free space,
   Wi-Fi, HA link.
-  Tap the screen's header for a details page: controller state, unique IDs and
-  the 5 busiest IDs, buffer fill and high-water marks, SD space, current
-  segment, slowest sync and uptime.
+  Buttons along the bottom open a details page (controller state, unique IDs
+  and the 5 busiest IDs, buffer fill and high-water marks, SD space, current
+  segment, slowest sync and uptime) and a settings page (screen brightness,
+  default 50 %, kept across restarts and also settable from HA; firmware
+  version).
 - Health sensors in HA: buffer fill/peak, staging peak, SD free/size, slowest
   sync, heap/PSRAM free, main-loop time, uptime and last reset reason.
 - Device page with login (ESPHome `web_server`), capture list at `/files`,
   downloads at `/dl?f=<name>`. HA's device card links to it ("Visit").
-- Safe shutdown (HA button, or hold the bar on screen for 2 s) closes the SD
+- Safe shutdown (HA button, or hold the middle button on screen for 4 s) closes the SD
   files before power-off; RESTART on screen resumes logging.
 
 ## Home Assistant

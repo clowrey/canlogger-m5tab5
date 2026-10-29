@@ -216,10 +216,11 @@ views:
             entity: sensor.tab5_can_logger_reset_reason
             name: Last reset
           - type: tile
-            entity: light.tab5_can_logger_display_backlight
-            name: Backlight
+            entity: number.tab5_can_logger_screen_brightness
+            name: Screen brightness
             features:
-              - type: light-brightness
+              - type: numeric-input
+                style: buttons
             grid_options:
               columns: 12
           - type: entities

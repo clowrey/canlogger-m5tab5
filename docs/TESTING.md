@@ -76,8 +76,8 @@ when:
 ## 3. Screen, details and rate under load
 
 Run section 1's `--full` sender with `states --watch` and look at the screen:
-frames/s and bus load update once a second, overruns stay 0. Tap the header
-for the details page. `tools/tab5_api.py states <tab5-ip> --all` prints every
+frames/s and bus load update once a second, overruns stay 0. Tap DETAILS
+(bottom left) for the details page. `tools/tab5_api.py states <tab5-ip> --all` prints every
 entity (unique IDs, busiest IDs, buffers, SD, health).
 
 Only one program can hold the CANable at a time; a second one stops with
