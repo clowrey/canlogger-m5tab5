@@ -309,8 +309,62 @@ sensor:
     id: wifi_rssi
     name: "WiFi Signal"
     update_interval: 10s
+  # battery (2S Li-ion, NP-F550 size): INA226 at 0x41 on the internal bus with a
+  # 5 mOhm shunt, as in ESPHome's M5Stack-Tab5 device config
+  - platform: ina226
+    i2c_id: bsp_bus
+    address: 0x41
+    shunt_resistance: 0.005 ohm
+    max_current: 8.192A
+    adc_averaging: 16
+    update_interval: 10s
+    bus_voltage:
+      id: battery_voltage
+      name: "Battery voltage"
+      accuracy_decimals: 2
+    current:
+      id: battery_current
+      name: "Battery current"     # positive = discharging, negative = charging
+      accuracy_decimals: 2
+    power:
+      id: battery_power
+      name: "Battery power"
+      accuracy_decimals: 1
+  - platform: copy               # rough charge level from the resting voltage per cell
+    source_id: battery_voltage
+    id: battery_level
+    name: "Battery level"
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    filters:
+      - lambda: "return x < 5.0f ? NAN : x;"   # no battery fitted reads about 2 V
+      - multiply: 0.5
+      - calibrate_linear:
+          method: exact
+          datapoints:
+            - 3.00 -> 0
+            - 3.30 -> 3
+            - 3.50 -> 10
+            - 3.60 -> 20
+            - 3.70 -> 38
+            - 3.80 -> 58
+            - 3.90 -> 72
+            - 4.00 -> 85
+            - 4.15 -> 100
+      - lambda: "return std::isnan(x) ? NAN : std::clamp(x, 0.0f, 100.0f);"   # clamp: would make NAN 0
 
 binary_sensor:
+  - platform: gpio
+    id: battery_charging
+    name: "Battery charging"
+    device_class: battery_charging
+    pin:
+      pi4ioe5v6408: pi4ioe2
+      number: 6
+      mode:
+        input: true
+        pulldown: true
   - platform: template
     name: "SD OK"
     lambda: "return id(canlog).sd_ok();"
@@ -568,12 +622,23 @@ display:
         return;
       }
 
-      // header (all pages)
+      char b[64], l[48];
+      // battery: level is NAN with none fitted; charging/discharging from the current's sign
+      const float bv = id(battery_voltage).state, bl = id(battery_level).state;
+      const float bi = id(battery_current).state;
+      const char *bat_dir = bi < -0.02f ? "charging" : (bi > 0.02f ? "discharging" : "idle");
+
+      // header (all pages), battery top right
       const int page = id(display_page);
       int y = 40;
       it.print(30, y, id(font_mid), fg, "TAB5 CAN LOGGER");
-      it.print(690, y + 10, id(font_small), dim, TextAlign::TOP_RIGHT,
-               page == 1 ? "details" : (page == 2 ? "settings" : ""));
+      if (std::isnan(bl)) {
+        it.print(690, y + 10, id(font_small), dim, TextAlign::TOP_RIGHT, std::isnan(bv) ? "" : "no battery");
+      } else {
+        snprintf(b, sizeof(b), "%s %.0f%%", bi < -0.02f ? "CHG" : "BAT", bl);
+        it.print(690, y + 10, id(font_small), bi < -0.02f ? ok : (bl > 30 ? fg : (bl > 15 ? warn : bad)),
+                 TextAlign::TOP_RIGHT, b);
+      }
       y += 60;
       it.printf(30, y, id(font_small), dim, "%s   500 kbit/s listen-only",
                 id(ip_addr).state.empty() ? "no IP" : id(ip_addr).state.c_str());
@@ -590,7 +655,6 @@ display:
                 api::global_api_server->is_connected_with_state_subscription();
       it.print(420, y, id(font_mid), ha ? ok : warn, ha ? "HA  OK" : "HA  --");
       y += 80;
-      char b[64], l[48];
 
       if (page == 2) {
         // ---- settings page: screen brightness (touch regions brightness_down/up 620..760) ----
@@ -661,6 +725,17 @@ display:
         snprintf(b, sizeof(b), "slowest sync %.0f ms   up %dh%02dm", id(canlog).sd_sync_max_ms(), h, m);
         it.print(30, y, id(font_small), dim, b);
         y += 50;
+        y += 12;
+
+        if (std::isnan(bl)) {
+          label("BATTERY");
+          line(dim, std::isnan(bv) ? "-" : "none fitted, on 5 V");
+        } else {
+          snprintf(l, sizeof(l), "BATTERY  %.0f %%  %s", bl, bat_dir);
+          label(l);
+          snprintf(b, sizeof(b), "%.2f V  %.2f A  %.1f W", bv, fabsf(bi), id(battery_power).state);
+          line(fg, b);
+        }
       } else {
 
       // a cell is a small label over a big value; x = 30 (left) or 390 (right column)

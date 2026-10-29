@@ -30,6 +30,9 @@ What it does:
   version).
 - Health sensors in HA: buffer fill/peak, staging peak, SD free/size, slowest
   sync, heap/PSRAM free, main-loop time, uptime and last reset reason.
+- Battery (from the Tab5's INA226): voltage, current, power and an estimated
+  level, in HA, top right on the screen and on the details page. With no
+  battery fitted the screen says so and the level is unknown.
 - Device page with login (ESPHome `web_server`), capture list at `/files`,
   downloads at `/dl?f=<name>`. HA's device card links to it ("Visit").
 - Safe shutdown (HA button, or hold the middle button on screen for 4 s) closes the SD

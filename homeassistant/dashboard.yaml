@@ -114,6 +114,18 @@ views:
                 text: Restart the Tab5? Logging continues in a new segment.
             hold_action:
               action: more-info
+          - type: tile
+            entity: sensor.tab5_can_logger_battery_level
+            name: Battery
+          - type: tile
+            entity: sensor.tab5_can_logger_battery_voltage
+            name: Battery voltage
+          - type: tile
+            entity: sensor.tab5_can_logger_battery_current
+            name: Current (+ = discharging)
+          - type: tile
+            entity: sensor.tab5_can_logger_battery_power
+            name: Battery power
       - type: grid
         cards:
           - type: heading
