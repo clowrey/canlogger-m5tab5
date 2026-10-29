@@ -9,6 +9,11 @@ capture files over HTTP and shows live stats on the Tab5 screen.
 A **CANable 2.0** next to it is the independent reference logger, and doubles as
 a test-traffic generator on the desk. See [docs/TESTING.md](docs/TESTING.md).
 
+<img src="docs/images/tab5-screen.jpg" alt="Tab5 status screen after a 60,000-frame desk test (peak 2,813 frames/s, 0 overruns), with the M5 Unit CAN beside it" width="450">
+
+*The status screen after a 60,000-frame desk test: peak 2,813 frames/s, 0
+overruns, 0 bus errors. The M5 Unit CAN (CA-IS3050G) is on Port A.*
+
 What it does:
 
 - Logs **every frame** to the SD card, listen-only (no TX pin: it can't ACK or
