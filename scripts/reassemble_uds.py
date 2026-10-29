@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Reconstruct a firmware image from a captured UDS-over-CAN flash session.
 
-Reads a Tab5 .canbin capture (ideally the carved flash_<ts>.canbin), reassembles
+Reads a Tab5 .canbin capture (the segment holding the session), reassembles
 ISO-TP messages on the tester->ECU id, and concatenates the payloads of every
 TransferData (0x36) request in block-sequence order into a raw .bin.
 
-    python3 reassemble_uds.py flash_12345.canbin --tx-id 0x602 -o image.bin
+    python3 reassemble_uds.py seg0012.canbin --tx-id 0x602 -o image.bin
 
 What it reports:
   * RequestDownload (0x34): dataFormatId, address, uncompressed size

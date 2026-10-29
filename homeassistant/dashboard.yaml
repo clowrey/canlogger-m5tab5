@@ -19,9 +19,6 @@ views:
             entity: binary_sensor.tab5_can_logger_capture_valid_0_overruns
             name: Capture valid
           - type: tile
-            entity: binary_sensor.tab5_can_logger_flash_session_active
-            name: Flash session
-          - type: tile
             entity: binary_sensor.tab5_can_logger_sd_ok
             name: SD card
           - type: tile
@@ -50,68 +47,30 @@ views:
       - type: grid
         cards:
           - type: heading
-            heading: UDS flash
+            heading: Files
             heading_style: title
-          - type: conditional        # progress is unknown until a 0x34 announces a size
-            conditions:
-              - condition: state
-                entity: sensor.tab5_can_logger_uds_progress
-                state_not: unknown
-              - condition: state
-                entity: sensor.tab5_can_logger_uds_progress
-                state_not: unavailable
-            grid_options:
-              columns: 12
-            card:
-              type: gauge
-              entity: sensor.tab5_can_logger_uds_progress
-              name: Download progress
-              min: 0
-              max: 100
-              needle: false
           - type: tile
-            entity: sensor.tab5_can_logger_uds_last_service
-            name: Last service
+            entity: sensor.tab5_can_logger_current_segment
+            name: Current segment
             grid_options:
               columns: 12
           - type: tile
-            entity: sensor.tab5_can_logger_uds_data_sent
-            name: Data sent
+            entity: sensor.tab5_can_logger_segment_size
+            name: Segment size
           - type: tile
-            entity: sensor.tab5_can_logger_uds_download_size
-            name: Download size
-          - type: tile
-            entity: sensor.tab5_can_logger_uds_blocks
-            name: Blocks
-          - type: tile
-            entity: sensor.tab5_can_logger_flash_session_duration
-            name: Session time
-          - type: tile
-            entity: sensor.tab5_can_logger_uds_download_address
-            name: Address
-            grid_options:
-              columns: 12
-          - type: tile
-            entity: sensor.tab5_can_logger_last_flash_capture
-            name: Last flash file
-            grid_options:
-              columns: 12
-          - type: tile
-            entity: sensor.tab5_can_logger_last_flash_file_bytes
-            name: Last flash file size
-            grid_options:
-              columns: 12
+            entity: sensor.tab5_can_logger_sd_free
+            name: SD free
           - type: markdown
             grid_options:
               columns: 12
             content: >-
-              {% set f = states('sensor.tab5_can_logger_last_flash_capture') %}
+              {% set f = states('sensor.tab5_can_logger_current_segment') %}
               **[Open capture files](http://<tab5-ip>/files)** · [Device page](http://<tab5-ip>/)
 
 
-              {% if f not in ['', 'unknown', 'unavailable'] %}Latest flash capture:
-              [{{ f }}](http://<tab5-ip>/dl?f={{ f }}){% else %}No flash session
-              captured yet.{% endif %}
+              {% if f not in ['', '-', 'unknown', 'unavailable'] %}Logging to
+              [{{ f }}](http://<tab5-ip>/dl?f={{ f }}) (a new segment starts every
+              64 MB).{% else %}SD card not mounted.{% endif %}
 
 
               <small>Pages use the Tab5's web_server login. Large files download

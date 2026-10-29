@@ -1,10 +1,10 @@
 # canlogger-m5tab5
 
 Lossless CAN logger on an **M5Stack Tab5 (ESP32-P4)** with an **M5 Unit CAN
-(CA-IS3050G)**, built to capture a whole **UDS-over-CAN firmware flash** at
-500 kbit/s and rebuild the image from it. It runs as an ESPHome external
-component, so the same device streams status to Home Assistant, serves its
-capture files over HTTP and shows live stats on the Tab5 screen.
+(CA-IS3050G)**: it records every frame on the bus to the SD card, continuously,
+for as long as it runs. It runs as an ESPHome external component, so the same
+device streams status to Home Assistant, serves its capture files over HTTP and
+shows live stats on the Tab5 screen.
 
 A **CANable 2.0** next to it is the independent reference logger, and doubles as
 a test-traffic generator on the desk. See [docs/TESTING.md](docs/TESTING.md).
@@ -18,19 +18,14 @@ What it does:
 
 - Logs **every frame** to the SD card, listen-only (no TX pin: it can't ACK or
   disturb the bus), with µs timestamps, in rotating `segNNNN.canbin` files.
-- Spots a UDS flash session (`0x34` RequestDownload on the tester id) and writes
-  a separate `flash_<boot>_<ms>.canbin` from 5 s before `0x34` to 2 s after
-  `0x37` RequestTransferExit.
 - Counts any lost frame (`CAN overruns`) and clears **Capture valid** if one is
   lost, so a capture is only trusted when the count is 0.
 - Screen and HA sensors: frames captured, frames/s (and peak), bus load %,
-  overruns, bus errors, MB written, SD and flash-session state, Wi-Fi, HA link.
+  overruns, bus errors, MB written, current segment, SD state and free space,
+  Wi-Fi, HA link.
   Tap the screen's header for a details page: controller state, unique IDs and
   the 5 busiest IDs, buffer fill and high-water marks, SD space, current
-  segment, slowest sync, uptime and UDS state.
-- Live UDS flash progress, sniffed from the tester's requests: the address and
-  size `0x34` announces, data sent so far (% done), `0x36` blocks, last service
-  and session time. Shown on the screen during a flash and as HA sensors.
+  segment, slowest sync and uptime.
 - Health sensors in HA: buffer fill/peak, staging peak, SD free/size, slowest
   sync, heap/PSRAM free, main-loop time, uptime and last reset reason.
 - Device page with login (ESPHome `web_server`), capture list at `/files`,
@@ -41,8 +36,10 @@ What it does:
 ## Home Assistant
 
 The device joins HA through the ESPHome integration. The example dashboard in
-[homeassistant/dashboard.yaml](homeassistant/dashboard.yaml) looks like this
-during a (synthetic) 2 MB flash at ~3,000 frames/s:
+[homeassistant/dashboard.yaml](homeassistant/dashboard.yaml) has capture,
+files, power, bus and diagnostics sections. The screenshot is from an earlier
+version, which also tracked UDS flash sessions (that section has since been
+replaced by a Files section):
 
 <img src="docs/images/ha-dashboard.png" alt="Home Assistant dashboard for the Tab5 CAN logger during a 2 MB synthetic UDS flash: 40.2 % download progress, 2,977 frames/s, 66 % bus load, 0 overruns, busiest IDs, history graphs, storage and diagnostics" width="600">
 
@@ -51,7 +48,7 @@ during a (synthetic) 2 MB flash at ~3,000 frames/s:
 ```
 components/can_logger/     ESPHome external component (the capture engine)
 esphome/                   device config, secrets.yaml.example, device-page link script
-scripts/                   capture tools: convert, rebuild the image, CANable logger and test senders
+scripts/                   capture tools: convert, rebuild a UDS flash, CANable logger and test senders
 tools/                     test helpers: Tab5 API, file download, log comparison
 homeassistant/             example HA dashboard
 canable-fw/                CANable 2.0 firmware notes and the board patch for Elmue's Candlelight
@@ -80,33 +77,37 @@ Built and tested with **ESPHome 2026.7.2** (ESP-IDF 5.5.5). Building in Linux or
 WSL is much faster than native Windows (90 s against 12 min for a clean build
 here).
 
-Set `diag_tx_id` in the `can_logger:` block to the tester's request id
-(`0` = detect `0x34`/`0x37` on any id). `preroll_ms` / `postroll_ms` set the flash
-file's margins.
-
-## Capturing a flash
+## Capturing
 
 1. Power the Tab5, check the screen: SD OK, overruns 0.
 2. Optional: start the reference logger on a PC with the CANable on the same bus:
    ```bash
    python scripts/canable_log.py -o canable.log
    ```
-3. Run the flash. **Flash session active** turns on, then off 2 s after `0x37`;
-   **Last flash capture** names the file.
+3. Leave it running. Every frame goes to `segNNNN.canbin`; a new segment starts
+   every 64 MB (about 20 minutes at 2,300 frames/s).
 4. Before pulling power: **Safe shutdown**, wait for SAFE TO POWER OFF.
-5. Get the file from the device page, `python tools/tab5_fetch.py <tab5-ip> flash`,
-   or the SD card (faster than Wi-Fi for big files). The device page links to
-   the capture list at `/files`; each name downloads the file:
+5. Get the files from the device page, `python tools/tab5_fetch.py <tab5-ip> seg`
+   (the newest segment), or the SD card (much faster than Wi-Fi for big files).
+   The device page links to the capture list at `/files`; each name downloads
+   the file:
 
-   <img src="docs/images/web-files.png" alt="The Tab5's /files page: a list of segNNNN.canbin and flash_*.canbin capture files" width="300">
-6. Rebuild the image and cross-check:
+   <img src="docs/images/web-files.png" alt="The Tab5's /files page: a list of .canbin capture files" width="300">
+6. Convert and cross-check:
    ```bash
-   python scripts/reassemble_uds.py flash_<boot>_<ms>.canbin --tx-id 0x602 -o image.bin
-   python scripts/canbin2candump.py flash_<boot>_<ms>.canbin -o tab5.log -i can0
+   python scripts/canbin2candump.py seg0012.canbin -o tab5.log -i can0
+   python tools/compare_logs.py subset tab5.log canable.log
    ```
-   `reassemble_uds.py` prints each block and checks the total against the size
-   announced in `0x34` (MATCH/MISMATCH). Compare `tab5.log` with the CANable's log
-   over the same stretch (timestamps differ; frames must not).
+   `subset` checks that every frame the CANable logged is in the Tab5 capture in
+   the same order, and lists frames only the Tab5 has (timestamps differ; frames
+   must not).
+7. To rebuild a UDS-over-CAN firmware download from a capture, point
+   `reassemble_uds.py` at the segment holding it, with the tester's request id:
+   ```bash
+   python scripts/reassemble_uds.py seg0012.canbin --tx-id 0x602 -o image.bin
+   ```
+   It prints each block and checks the total against the size announced in
+   `0x34` (MATCH/MISMATCH).
 
 ## How the capture stays lossless
 
@@ -117,7 +118,7 @@ on_rx_done (IRAM, cache-safe ISR)        runs even while the flash cache is off 
 capture_task (core 1, priority 20)
   → 24-byte record → PSRAM ring (16 MB)
 writer_task (core 0, priority 5)
-  → SD segment file + flash-session carving, fsync every second
+  → SD segment file, fsync every second
 ESPHome loop (priority 1)
   → HA entities, web server, screen, rate/bus-load maths
 ```
@@ -133,31 +134,31 @@ ESPHome loop (priority 1)
 - The screen and HA can't hold up capture: the capture task always preempts
   ESPHome's loop (whose longest pass, mostly redrawing the screen, is ~200-260
   ms). Its per-frame extra work for the statistics is a few counter increments
-  (rate, bus bits, per-ID count) and a high-water compare. UDS progress is
-  worked out in the writer task, ID ranking and rates in ESPHome's loop, and the
-  SD's free space is read once at mount (FatFS's free-space scan can be slow), then
-  estimated from what's been written.
+  (rate, bus bits, per-ID count) and a high-water compare. ID ranking and rates
+  are worked out in ESPHome's loop, and the SD's free space is read once at mount
+  (FatFS's free-space scan can be slow), then estimated from what's been written.
 - The bus state comes from the driver's `on_state_change` callback, not
   `twai_node_get_info()`: with a listen-only node and no TX queue, the latter's
   status path asserts on a null queue.
-- Measured on the desk: up to ~2,700 frames/s (8-byte frames, ~60 % bus load)
-  with 0 overruns. A real flash at STmin 0 could reach ~4,000+ frames/s, still
-  well within the buffers (2,048 frames in internal RAM, 16 MB in PSRAM, about
-  100 KB/s to SD at full load), but not yet tested.
+- Measured: up to ~2,700 frames/s on the desk (8-byte frames, ~60 % bus load)
+  and ~2,300 frames/s on a live vehicle bus, with 0 overruns (see
+  docs/TESTING.md). The buffers (2,048 frames in internal RAM, 16 MB in PSRAM,
+  about 100 KB/s to SD at full load) leave room for more; not yet tested above
+  ~2,800 frames/s.
 
 ## Capture files (`.canbin`, little-endian)
 
 32-byte `FileHeader` (`CANBIN01`, version, record size, bitrate, epoch), then
 fixed **24-byte records**: µs timestamp, id (bit 31 extended, bit 30 RTR,
 bit 29 meta), dlc, flags (bit 0 `GAP`: frames were lost before this one), 8 data
-bytes. Flash files start with a `FLASH_START` meta record (dlc = 2, id = trigger
-id) and end with `FLASH_END` (dlc = 3). Event codes 1, 4 and 5 are reserved. The
-layout is defined in `can_logger.h` and mirrored by the scripts.
+bytes. The layout is defined in `can_logger.h` and mirrored by the scripts.
 
-- `segNNNN.canbin`: everything, rotating at 64 MB. Numbering continues from the
-  highest file on the card, so a reboot never overwrites a capture.
-- `flash_<boot>_<ms>.canbin`: one UDS flash session. `<boot>` is that boot's
-  first segment number, `<ms>` the trigger time in ms since boot.
+Files are `segNNNN.canbin`: everything, rotating at 64 MB (`seg_bytes`).
+Numbering continues from the highest file on the card, so a reboot never
+overwrites a capture. Older firmware also carved UDS flash sessions into
+`flash_<boot>_<ms>.canbin`, framed by `FLASH_START`/`FLASH_END` meta records
+(event codes 2 and 3); the scripts still read those. Event codes 1, 4 and 5 are
+reserved.
 
 Timestamps are µs since boot (no wall clock yet).
 
@@ -168,6 +169,9 @@ Timestamps are µs since boot (no wall clock yet).
   Safe shutdown. The card stays mounted on purpose: unmounting would deinit the
   SDMMC host the C6 Wi-Fi shares.
 - **Classic CAN only:** the P4's TWAI controllers don't do CAN FD.
+- **SD space:** a busy bus fills a card fast (~190 MB/hour at 2,300 frames/s).
+  Nothing is deleted automatically, and once the card is full, writes fail
+  without counting as overruns: keep an eye on **SD free**.
 - **Wi-Fi downloads are slow** on a weak signal (seconds to minutes per MB). For
   big captures, copy the SD card.
 - `reassemble_uds.py` handles normal-addressing ISO-TP with one tester id. Check

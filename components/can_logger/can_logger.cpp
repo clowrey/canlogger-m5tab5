@@ -42,18 +42,9 @@ static uint32_t round_up_pow2(uint32_t v) {
 // writer-task state kept in the .cpp to keep the header lean
 namespace {
 FILE *g_seg_file = nullptr;       // free-run rotating segment
-FILE *g_flash_file = nullptr;     // carved UDS flash session
-char g_flash_name[64] = {0};
 uint32_t g_seg_bytes_written = 0;
-uint32_t g_flash_bytes_written = 0;
-uint64_t g_flash_end_deadline = 0;  // 0 = not in post-roll
-// pre-roll ring (PSRAM): recent records to prepend to a flash file
-Record *g_pre = nullptr;
-uint32_t g_pre_cap = 0, g_pre_head = 0, g_pre_count = 0;
 httpd_handle_t g_httpd = nullptr;
 std::string g_sd_path;            // copy for http handlers
-char g_last_flash_name[64] = {0};
-uint32_t g_boot_seg = 0;          // first segment index of this boot
 }  // namespace
 
 // Next unused segNNNN index on the card, so a reboot (power blip, OTA) never
@@ -193,11 +184,6 @@ void CanLogger::setup() {
   }
   ESP_LOGI(TAG, "PSRAM ring: %u records (%u MB); staging: %u frames (internal)",
            ring_cap_, ring_mb_, stage_cap_);
-
-  // pre-roll ring (bounded): preroll_ms at an assumed worst-case ~8000 fps, capped
-  g_pre_cap = round_up_pow2(std::min<uint32_t>(preroll_ms_ * 8u, 65536u));
-  g_pre = (Record *) heap_caps_malloc((size_t) g_pre_cap * sizeof(Record), MALLOC_CAP_SPIRAM);
-  g_pre_head = g_pre_count = 0;
 
   // per-ID counters (capture task) in internal RAM; the loop's snapshot in PSRAM
   id_counts_ = (uint32_t *) heap_caps_calloc(2048, sizeof(uint32_t), MALLOC_CAP_INTERNAL);
@@ -344,10 +330,8 @@ void CanLogger::write_header_(void *fp) {
 
 void CanLogger::open_segment_() {
   static uint32_t seg_idx = UINT32_MAX;
-  if (seg_idx == UINT32_MAX) {
+  if (seg_idx == UINT32_MAX)
     seg_idx = next_free_seg_index(sd_path_);
-    g_boot_seg = seg_idx;
-  }
   char path[160];
   seg_index_.store(seg_idx);
   snprintf(path, sizeof(path), "%s/seg%04u.canbin", sd_path_.c_str(), seg_idx++);
@@ -371,174 +355,17 @@ void CanLogger::close_segment_() {
   }
 }
 
-void CanLogger::open_flash_file_(const Record &trigger) {
-  char path[160];
-  // boot's first segment index + ms since boot: unique across reboots
-  snprintf(g_flash_name, sizeof(g_flash_name), "flash_%04u_%llu.canbin", (unsigned) g_boot_seg,
-           (unsigned long long) (trigger.ts_us / 1000));
-  snprintf(path, sizeof(path), "%s/%s", sd_path_.c_str(), g_flash_name);
-  g_flash_file = fopen(path, "wb");
-  if (!g_flash_file) {
-    ESP_LOGE(TAG, "cannot open flash file %s", path);
-    return;
-  }
-  write_header_(g_flash_file);
-  g_flash_bytes_written = sizeof(FileHeader);
-
-  // meta marker, then dump the pre-roll ring oldest->newest
-  Record m;
-  std::memset(&m, 0, sizeof(m));
-  m.ts_us = trigger.ts_us;
-  m.id = REC_META | (trigger.id & 0x1FFFFFFFu);
-  m.dlc = EV_FLASH_START;
-  fwrite(&m, sizeof(m), 1, g_flash_file);
-  g_flash_bytes_written += sizeof(Record);
-
-  // The ring is sized by frame count; only frames from the last preroll_ms go in,
-  // or a quiet bus would drag in traffic from long before the session.
-  const uint64_t window_us = (uint64_t) preroll_ms_ * 1000ull;
-  const uint64_t oldest = trigger.ts_us > window_us ? trigger.ts_us - window_us : 0;
-  uint32_t n = g_pre_count, kept = 0;
-  uint32_t start = (g_pre_head + g_pre_cap - n) & (g_pre_cap - 1);
-  for (uint32_t i = 0; i < n; i++) {
-    Record &pr = g_pre[(start + i) & (g_pre_cap - 1)];
-    if (pr.ts_us < oldest)
-      continue;
-    fwrite(&pr, sizeof(Record), 1, g_flash_file);
-    g_flash_bytes_written += sizeof(Record);
-    kept++;
-  }
-  sync_file(g_flash_file);
-  flash_written_.fetch_add(g_flash_bytes_written);
-  flash_active_.store(true);
-  // new session: progress starts from this 0x34 (uds_sniff_ fills in its size)
-  sess_start_ms_.store(std::max<uint32_t>(1, (uint32_t) (trigger.ts_us / 1000)));
-  sess_end_ms_.store(0);
-  uds_blocks_.store(0);
-  ESP_LOGI(TAG, "FLASH session start -> %s (pre-roll %u recs)", path, kept);
-}
-
-void CanLogger::close_flash_file_() {
-  if (!g_flash_file)
-    return;
-  Record m;
-  std::memset(&m, 0, sizeof(m));
-  m.ts_us = (uint64_t) esp_timer_get_time();
-  m.id = REC_META;
-  m.dlc = EV_FLASH_END;
-  fwrite(&m, sizeof(m), 1, g_flash_file);
-  g_flash_bytes_written += sizeof(Record);
-  flash_written_.fetch_add(sizeof(Record));
-  fclose(g_flash_file);
-  g_flash_file = nullptr;
-  flash_active_.store(false);
-  sess_end_ms_.store(std::max<uint32_t>(1, (uint32_t) (esp_timer_get_time() / 1000)));
-  last_flash_bytes_.store(g_flash_bytes_written);
-  std::strncpy(g_last_flash_name, g_flash_name, sizeof(g_last_flash_name) - 1);
-  g_flash_end_deadline = 0;
-  ESP_LOGI(TAG, "FLASH session end: %s (%u bytes)", g_flash_name, g_flash_bytes_written);
-}
-
-// Progress of the current download, from the tester's requests only (no ECU
-// replies needed): 0x34's address and size (reassembled when it spans frames),
-// then the data length of each 0x36 from its single/first frame.
-void CanLogger::uds_sniff_(const Record &r) {
-  uint8_t pci = r.data[0] >> 4;
-  uint32_t len = 0;
-  const uint8_t *payload = nullptr;
-  uint8_t have = 0;
-  if (pci == 0x0 && r.dlc >= 2) {  // single frame
-    len = r.data[0] & 0x0F;
-    payload = &r.data[1];
-    have = std::min<uint32_t>(len, r.dlc - 1);
-  } else if (pci == 0x1 && r.dlc >= 3) {  // first frame
-    len = ((r.data[0] & 0x0F) << 8) | r.data[1];
-    payload = &r.data[2];
-    have = r.dlc - 2;
-  } else if (pci == 0x2 && req34_len_ && req34_have_ < req34_len_) {  // 0x34 continues
-    uint8_t n = std::min<uint32_t>(r.dlc - 1, req34_len_ - req34_have_);
-    std::memcpy(&req34_[req34_have_], &r.data[1], n);
-    req34_have_ += n;
-  } else {
-    return;
-  }
-  if (payload != nullptr && len > 0) {
-    uint8_t svc = payload[0];
-    uds_last_svc_.store(svc);
-    req34_len_ = 0;
-    if (svc == 0x36 && len >= 2) {
-      uds_dl_bytes_.fetch_add(len - 2);
-      uds_blocks_.fetch_add(1);
-    } else if (svc == 0x34 && len <= sizeof(req34_)) {
-      req34_len_ = len;
-      req34_have_ = std::min<uint8_t>(have, len);
-      std::memcpy(req34_, payload, req34_have_);
-    }
-  }
-  // 0x34 dataFormat, addressAndLengthFormat (high nibble size bytes, low address bytes)
-  if (req34_len_ >= 3 && req34_have_ == req34_len_) {
-    uint8_t alen = req34_[2] & 0x0F, slen = req34_[2] >> 4;
-    if (alen <= 4 && slen <= 4 && 3u + alen + slen <= req34_len_) {
-      uint32_t addr = 0, size = 0;
-      for (uint8_t i = 0; i < alen; i++)
-        addr = (addr << 8) | req34_[3 + i];
-      for (uint8_t i = 0; i < slen; i++)
-        size = (size << 8) | req34_[3 + alen + i];
-      uds_dl_addr_.store(addr);
-      uds_dl_size_.store(size);
-      uds_dl_bytes_.store(0);
-    }
-    req34_len_ = 0;
-  }
-}
-
-// Inspect one record for UDS flash boundaries, maintain pre-roll + files.
+// Every record goes to the current segment, which rotates at seg_bytes.
 void CanLogger::writer_handle_record_(const Record &r) {
-  const bool meta = (r.id & REC_META) != 0;
-
-  // UDS service detection on ISO-TP SF/FF (sniffed, tester->ECU direction)
-  if (!meta && r.dlc >= 2 && (diag_tx_id_ == 0 || (r.id & 0x1FFFFFFFu) == diag_tx_id_)) {
-    uint8_t pci = r.data[0] >> 4;
-    uint8_t svc = 0xFF;
-    if (pci == 0x0 && r.dlc >= 2) svc = r.data[1];        // single frame
-    else if (pci == 0x1 && r.dlc >= 3) svc = r.data[2];   // first frame
-    if (svc == 0x34 && !g_flash_file) {
-      open_flash_file_(r);
-    } else if (svc == 0x37 && g_flash_file) {
-      // begin post-roll: keep writing until deadline
-      g_flash_end_deadline = r.ts_us + (uint64_t) postroll_ms_ * 1000ull;
-    }
-    uds_sniff_(r);
-  }
-
-  // write to free-run segment
-  if (g_seg_file) {
-    fwrite(&r, sizeof(Record), 1, g_seg_file);
-    g_seg_bytes_written += sizeof(Record);
-    seg_cur_bytes_.store(g_seg_bytes_written);
-    bytes_written_.fetch_add(sizeof(Record));
-    if (g_seg_bytes_written >= seg_bytes_) {
-      close_segment_();
-      open_segment_();
-    }
-  }
-
-  // write to flash file if active
-  if (g_flash_file) {
-    fwrite(&r, sizeof(Record), 1, g_flash_file);
-    g_flash_bytes_written += sizeof(Record);
-    flash_written_.fetch_add(sizeof(Record));
-    if (g_flash_end_deadline && r.ts_us >= g_flash_end_deadline)
-      close_flash_file_();
-  }
-
-  // feed the pre-roll ring last (data frames only): fed first, the 0x34 trigger
-  // would be dumped with the pre-roll and then written again above
-  if (!meta && g_pre) {
-    g_pre[g_pre_head] = r;
-    g_pre_head = (g_pre_head + 1) & (g_pre_cap - 1);
-    if (g_pre_count < g_pre_cap)
-      g_pre_count++;
+  if (g_seg_file == nullptr)
+    return;
+  fwrite(&r, sizeof(Record), 1, g_seg_file);
+  g_seg_bytes_written += sizeof(Record);
+  seg_cur_bytes_.store(g_seg_bytes_written);
+  bytes_written_.fetch_add(sizeof(Record));
+  if (g_seg_bytes_written >= seg_bytes_) {
+    close_segment_();
+    open_segment_();
   }
 }
 
@@ -608,7 +435,6 @@ void CanLogger::finish_shutdown_() {
     writer_handle_record_(r);
     drained++;
   }
-  close_flash_file_();  // writes the FLASH_END marker if a session was open
   close_segment_();
   shutdown_done_.store(true);
   ESP_LOGI(TAG, "safe shutdown: %u buffered records written, files closed - safe to power off",
@@ -646,7 +472,6 @@ void CanLogger::writer_task() {
     int64_t now = esp_timer_get_time();
     if (now - last_sync >= 1000000) {
       sync_file(g_seg_file);
-      sync_file(g_flash_file);
       uint32_t took = (uint32_t) (esp_timer_get_time() - now);  // slow card = ring fills
       if (took > sd_sync_max_us_.load())
         sd_sync_max_us_.store(took);
@@ -654,12 +479,7 @@ void CanLogger::writer_task() {
     }
     if (got) {
       if (g_seg_file) fflush(g_seg_file);
-      if (g_flash_file) fflush(g_flash_file);
     } else {
-      // if in post-roll with no traffic, honor the deadline by wall clock
-      if (g_flash_file && g_flash_end_deadline &&
-          (uint64_t) esp_timer_get_time() >= g_flash_end_deadline)
-        close_flash_file_();
       vTaskDelay(pdMS_TO_TICKS(2));
     }
   }
@@ -673,8 +493,6 @@ void CanLogger::start_capture() {
   ESP_LOGI(TAG, "capture armed");
 }
 void CanLogger::stop_capture() { running_.store(false); }
-
-std::string CanLogger::last_flash_file() const { return std::string(g_last_flash_name); }
 
 // ---- details (ESPHome loop) -----------------------------------------------
 // Every 2 s: distinct ids seen since boot and the busiest ids over the window.
@@ -750,7 +568,7 @@ float CanLogger::buffer_fill_pct() const {
 }
 
 float CanLogger::sd_free_gb() const {
-  uint64_t written = bytes_written_.load() + flash_written_.load();
+  uint64_t written = bytes_written_.load();
   uint64_t free = (uint64_t) sd_free0_mb_.load() << 20;
   return written >= free ? 0 : (free - written) / 1073741824.0f;
 }
@@ -761,48 +579,6 @@ std::string CanLogger::segment_name() const {
   char b[24];
   snprintf(b, sizeof(b), "seg%04u.canbin", (unsigned) seg_index_.load());
   return b;
-}
-
-float CanLogger::uds_progress_pct() const {
-  uint32_t size = uds_dl_size_.load();
-  if (size == 0)
-    return NAN;
-  return std::min(100.0f, 100.0f * uds_dl_bytes_.load() / size);
-}
-
-std::string CanLogger::uds_last_service_text() const {
-  int svc = uds_last_svc_.load();
-  if (svc < 0)
-    return "-";
-  const char *name = "";
-  switch (svc) {
-    case 0x10: name = " SessionControl"; break;
-    case 0x11: name = " ECUReset"; break;
-    case 0x14: name = " ClearDTC"; break;
-    case 0x19: name = " ReadDTC"; break;
-    case 0x22: name = " ReadDataByID"; break;
-    case 0x27: name = " SecurityAccess"; break;
-    case 0x28: name = " CommControl"; break;
-    case 0x2E: name = " WriteDataByID"; break;
-    case 0x31: name = " RoutineControl"; break;
-    case 0x34: name = " RequestDownload"; break;
-    case 0x35: name = " RequestUpload"; break;
-    case 0x36: name = " TransferData"; break;
-    case 0x37: name = " TransferExit"; break;
-    case 0x3E: name = " TesterPresent"; break;
-    case 0x85: name = " ControlDTCSetting"; break;
-  }
-  char b[40];
-  snprintf(b, sizeof(b), "0x%02X%s", svc, name);
-  return b;
-}
-
-float CanLogger::flash_session_s() const {
-  uint32_t start = sess_start_ms_.load(), end = sess_end_ms_.load();
-  if (start == 0)
-    return 0;
-  uint32_t stop = end ? end : (uint32_t) (esp_timer_get_time() / 1000);
-  return stop > start ? (stop - start) / 1000.0f : 0;
 }
 
 // ---- HTTP file server -----------------------------------------------------
@@ -926,8 +702,6 @@ void CanLogger::dump_config() {
                 sd_d0_, sd_d1_, sd_d2_, sd_d3_, sd_ldo_chan_);
   ESP_LOGCONFIG(TAG, "  sd=%s  ring=%uMB  seg=%uB  staging=%u frames", sd_path_.c_str(),
                 ring_mb_, seg_bytes_, stage_cap_);
-  ESP_LOGCONFIG(TAG, "  diag_tx_id=0x%X  preroll=%ums postroll=%ums", diag_tx_id_,
-                preroll_ms_, postroll_ms_);
   ESP_LOGCONFIG(TAG, "  overruns=%llu bus_errors=%llu",
                 (unsigned long long) overrun_total_.load(),
                 (unsigned long long) bus_errors_.load());

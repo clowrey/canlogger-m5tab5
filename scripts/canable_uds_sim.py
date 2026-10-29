@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Play a synthetic UDS-over-CAN flash session from a gs_usb CANable, for
-checking the Tab5's flash-file carving and reassemble_uds.py on a desk bus.
+checking that reassemble_uds.py rebuilds it from the Tab5's segment capture.
 
     python canable_uds_sim.py --size 20480 -p uds
 
@@ -10,8 +10,7 @@ control on --rx-id, plus background traffic on other ids. Never use this on a
 car: it transmits.
 
 Sequence: background, 0x10 02 / 0x27 seed-key, 0x34 RequestDownload (multi-frame),
-0x36 TransferData blocks, 0x37 RequestTransferExit, then background for longer
-than the Tab5's post-roll. Writes <prefix>_image.bin (the image that was sent)
+0x36 TransferData blocks, 0x37 RequestTransferExit, then background. Writes <prefix>_image.bin (the image that was sent)
 and the logs from canable_testgen.LoopbackSender.
 """
 import argparse

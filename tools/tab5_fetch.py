@@ -2,8 +2,7 @@
 """List or download capture files from the Tab5's web server.
 
     python tools/tab5_fetch.py <tab5-ip> --list
-    python tools/tab5_fetch.py <tab5-ip> seg                 # newest segNNNN.canbin
-    python tools/tab5_fetch.py <tab5-ip> flash -o captures   # newest flash_<boot>_<ms>.canbin
+    python tools/tab5_fetch.py <tab5-ip> seg -o captures     # newest segNNNN.canbin
     python tools/tab5_fetch.py <tab5-ip> seg0012.canbin      # a named file
 
 The web_server login is read from esphome/secrets.yaml (web_server_username /
@@ -26,7 +25,7 @@ DEFAULT_SECRETS = os.path.join(HERE, "..", "esphome", "secrets.yaml")
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("host")
-    ap.add_argument("what", nargs="?", default="seg", help="seg, flash or a file name")
+    ap.add_argument("what", nargs="?", default="seg", help="seg (the newest segment) or a file name")
     ap.add_argument("-o", "--outdir", default=".")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--secrets", default=DEFAULT_SECRETS)
@@ -37,15 +36,13 @@ def main():
     html = requests.get(f"http://{args.host}/files", auth=auth, timeout=20)
     html.raise_for_status()
     segs = sorted(set(re.findall(r"seg\d+\.canbin", html.text)), key=lambda n: int(n[3:-7]))
-    flashes = sorted(set(re.findall(r"flash_\d+_\d+\.canbin", html.text)),
-                     key=lambda n: tuple(int(x) for x in n[6:-7].split("_")))
+    # flash_*.canbin: files carved by older firmware, still listed and downloadable
+    flashes = sorted(set(re.findall(r"flash_\d+_\d+\.canbin", html.text)))
     if args.list:
         print("\n".join(segs + flashes))
         return
     if args.what == "seg":
         names = segs
-    elif args.what == "flash":
-        names = flashes
     else:
         names = [args.what] if args.what in segs + flashes else []
     if not names:

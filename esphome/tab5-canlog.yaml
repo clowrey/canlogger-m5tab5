@@ -135,9 +135,6 @@ can_logger:
   bitrate: 500000
   sd_path: /sdcard      # SDMMC slot 0, Tab5 pins/LDO are the component defaults
   ring_mb: 16           # of 32 MB PSRAM
-  diag_tx_id: 0x602     # tester -> ECU id; 0 = detect UDS 0x34/0x37 on any id
-  preroll_ms: 5000      # history kept before a 0x34 so you catch 0x10/0x27
-  postroll_ms: 2000
 
 switch:
   # Power rails on the IO expanders. M5's Tab5 BSP turns WLAN_PWR_EN and EXT_5V
@@ -213,14 +210,6 @@ sensor:
     accuracy_decimals: 2
     update_interval: 5s
     lambda: "return id(canlog).bytes_written() / 1048576.0f;"
-  - platform: template
-    name: "Last flash file bytes"
-    unit_of_measurement: B
-    device_class: data_size
-    state_class: measurement
-    accuracy_decimals: 0
-    update_interval: 5s
-    lambda: "return (float) id(canlog).last_flash_bytes();"
   - platform: template
     name: "CAN frame rate"
     unit_of_measurement: frames/s
@@ -298,42 +287,6 @@ sensor:
     accuracy_decimals: 1
     update_interval: 30s
     lambda: "return id(canlog).segment_mb();"
-  # UDS flash progress (tester requests on diag_tx_id)
-  - platform: template
-    name: "UDS progress"          # of the size the last 0x34 announced
-    unit_of_measurement: "%"
-    state_class: measurement
-    accuracy_decimals: 1
-    update_interval: 5s
-    lambda: "return id(canlog).uds_progress_pct();"
-  - platform: template
-    name: "UDS data sent"
-    unit_of_measurement: B
-    device_class: data_size
-    state_class: measurement
-    accuracy_decimals: 0
-    update_interval: 5s
-    lambda: "return id(canlog).uds_download_bytes();"
-  - platform: template
-    name: "UDS download size"
-    unit_of_measurement: B
-    device_class: data_size
-    accuracy_decimals: 0
-    update_interval: 10s
-    lambda: "return id(canlog).uds_download_size();"
-  - platform: template
-    name: "UDS blocks"            # 0x36 TransferData requests this session
-    state_class: measurement
-    accuracy_decimals: 0
-    update_interval: 5s
-    lambda: "return id(canlog).uds_blocks();"
-  - platform: template
-    name: "Flash session duration"
-    unit_of_measurement: s
-    device_class: duration
-    accuracy_decimals: 0
-    update_interval: 5s
-    lambda: "return id(canlog).flash_session_s();"
   - platform: uptime
     id: uptime_s
     name: "Uptime"
@@ -355,9 +308,6 @@ binary_sensor:
   - platform: template
     name: "SD OK"
     lambda: "return id(canlog).sd_ok();"
-  - platform: template
-    name: "Flash session active"
-    lambda: "return id(canlog).flash_active();"
   - platform: template
     name: "Capture valid (0 overruns)"
     lambda: "return id(canlog).capture_valid();"
@@ -421,9 +371,9 @@ binary_sensor:
               - lambda: "App.safe_reboot();"
 
 button:
-  # Stops capture, writes out the buffered frames, ends any UDS flash session
-  # file and closes the segment, so pulling power can't catch a FAT write half
-  # done. Capture only resumes after a restart.
+  # Stops capture, writes out the buffered frames and closes the segment, so
+  # pulling power can't catch a FAT write half done. Capture only resumes after
+  # a restart.
   - platform: template
     name: "Safe shutdown (close SD files)"
     icon: mdi:power-plug-off
@@ -437,10 +387,6 @@ text_sensor:
     reset_reason:
       name: "Reset reason"       # why the last restart happened (power-on, OTA, crash...)
   - platform: template
-    name: "Last flash capture"     # changes when a session closes -> HA automation hook
-    update_interval: 5s
-    lambda: "return id(canlog).last_flash_file();"
-  - platform: template
     name: "CAN bus state"          # active / warning / passive / bus-off
     update_interval: 10s
     lambda: "return std::string(id(canlog).bus_state());"
@@ -452,18 +398,6 @@ text_sensor:
     name: "Current segment"
     update_interval: 30s
     lambda: "return id(canlog).segment_name();"
-  - platform: template
-    name: "UDS last service"
-    update_interval: 5s
-    lambda: "return id(canlog).uds_last_service_text();"
-  - platform: template
-    name: "UDS download address"
-    update_interval: 10s
-    lambda: |-
-      if (id(canlog).uds_download_size() == 0) return std::string("-");
-      char b[16];
-      snprintf(b, sizeof(b), "0x%08X", (unsigned) id(canlog).uds_download_addr());
-      return std::string(b);
   - platform: wifi_info
     ip_address:
       id: ip_addr
@@ -614,17 +548,6 @@ display:
         snprintf(b, sizeof(b), "slowest sync %.0f ms   up %dh%02dm", id(canlog).sd_sync_max_ms(), h, m);
         it.print(30, y, id(font_small), dim, b);
         y += 50;
-
-        snprintf(l, sizeof(l), "UDS  last %s", id(canlog).uds_last_service_text().c_str());
-        label(l);
-        float pct = id(canlog).uds_progress_pct();
-        if (std::isnan(pct))
-          snprintf(b, sizeof(b), "--  %u blk  %.0f s", (unsigned) id(canlog).uds_blocks(),
-                   id(canlog).flash_session_s());
-        else
-          snprintf(b, sizeof(b), "%.0f%%  %u blk  %.0f s", pct, (unsigned) id(canlog).uds_blocks(),
-                   id(canlog).flash_session_s());
-        line(id(canlog).flash_active() ? warn : dim, b);
       } else {
 
       // a cell is a small label over a big value; x = 30 (left) or 390 (right column)
@@ -655,22 +578,12 @@ display:
       it.print(30, y, id(font_mid), id(canlog).sd_ok() ? ok : bad,
                id(canlog).sd_ok() ? "SD  OK" : "SD  NOT MOUNTED");
       y += 70;
-      if (id(canlog).flash_active()) {
-        // live progress of the current download: % of the size 0x34 announced
-        float pct = id(canlog).uds_progress_pct();
-        if (std::isnan(pct))
-          snprintf(b, sizeof(b), "UDS FLASH CAPTURING");
-        else
-          snprintf(b, sizeof(b), "UDS %.0f%%  %.2f/%.2f MB", pct,
-                   id(canlog).uds_download_bytes() / 1048576.0,
-                   id(canlog).uds_download_size() / 1048576.0);
-        it.print(30, y, id(font_mid), warn, b);
-      } else {
-        it.print(30, y, id(font_mid), dim, "no flash session");
-      }
+      snprintf(b, sizeof(b), "%s  %.1f MB", id(canlog).segment_name().c_str(), id(canlog).segment_mb());
+      it.print(30, y, id(font_mid), fg, b);
       y += 70;
-      std::string last = id(canlog).last_flash_file();
-      it.printf(30, y, id(font_small), dim, "last: %s", last.empty() ? "-" : last.c_str());
+      float free_gb = id(canlog).sd_free_gb();
+      snprintf(b, sizeof(b), "%.1f GB free of %.1f", free_gb, id(canlog).sd_total_gb());
+      it.print(30, y, id(font_small), free_gb > 1 ? dim : warn, b);
       }  // status page
 
       // touch region: shutdown_button (1100..1240)

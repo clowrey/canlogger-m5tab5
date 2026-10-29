@@ -20,7 +20,7 @@ from aioesphomeapi import APIClient, ButtonInfo
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SECRETS = os.path.join(HERE, "..", "esphome", "secrets.yaml")
 SUMMARY = ("CAN frames captured", "CAN frame rate", "CAN bus load", "CAN overruns", "CAN bus errors",
-           "Capture MB written", "SD OK", "Capture valid (0 overruns)", "Flash session active",
+           "Capture MB written", "Current segment", "SD free", "SD OK", "Capture valid (0 overruns)",
            "Safe to power off", "WiFi Signal")
 LIVE = ("CAN frame rate", "CAN bus load")
 

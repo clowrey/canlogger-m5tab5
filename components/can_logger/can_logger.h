@@ -7,9 +7,8 @@
 //       staging ring; staging overflow counts as an overrun.
 //   capture_task (core 1, prio 20): staging ring -> 24-byte Record -> PSRAM ring;
 //       PSRAM-ring overflow counts as an overrun. Never gated by ESPHome's loop.
-//   writer_task (core 0, prio 5): drains the PSRAM ring -> SD. Free-runs every
-//       frame to a rotating segment file, and carves a separate flash session file
-//       from UDS RequestDownload (0x34) to RequestTransferExit (0x37) + post-roll.
+//   writer_task (core 0, prio 5): drains the PSRAM ring -> SD, every frame to a
+//       rotating segment file.
 //   ESPHome loop(): rate/bus-load maths and stats for entities and the screen.
 
 #include "esphome/core/component.h"
@@ -72,8 +71,8 @@ static const uint8_t REC_FLAG_GAP = 1u << 0;
 
 enum EventCode : uint8_t {
   EV_CAPTURE_START = 1,  // reserved, not written yet
-  EV_FLASH_START = 2,    // flash file only: UDS RequestDownload (0x34) seen; id = trigger CAN id
-  EV_FLASH_END = 3,      // flash file only: post-roll ended, file closed
+  EV_FLASH_START = 2,    // only in flash_*.canbin files from older firmware
+  EV_FLASH_END = 3,      // only in flash_*.canbin files from older firmware
   EV_OVERRUN_GAP = 4,    // reserved, not written yet (loss is marked with REC_FLAG_GAP)
   EV_SEG_ROTATE = 5,     // reserved, not written yet
 };
@@ -96,9 +95,6 @@ class CanLogger : public Component {
   void set_bitrate(uint32_t b) { bitrate_ = b; }
   void set_sd_path(const std::string &p) { sd_path_ = p; }
   void set_ring_mb(uint32_t mb) { ring_mb_ = mb; }
-  void set_diag_tx_id(uint32_t id) { diag_tx_id_ = id; }
-  void set_preroll_ms(uint32_t ms) { preroll_ms_ = ms; }
-  void set_postroll_ms(uint32_t ms) { postroll_ms_ = ms; }
   void set_seg_bytes(uint32_t b) { seg_bytes_ = b; }
   void set_http_port(uint16_t p) { http_port_ = p; }
   void set_sd_pins(int clk, int cmd, int d0, int d1, int d2, int d3) {
@@ -123,10 +119,7 @@ class CanLogger : public Component {
   uint64_t overrun_total() const { return overrun_total_.load(); }
   uint64_t bytes_written() const { return bytes_written_.load(); }
   bool sd_ok() const { return sd_ok_.load(); }
-  bool flash_active() const { return flash_active_.load(); }
   bool capture_valid() const { return overrun_total_.load() == 0; }  // integrity gate
-  std::string last_flash_file() const;
-  uint32_t last_flash_bytes() const { return last_flash_bytes_.load(); }
   uint32_t bus_errors() const { return bus_errors_.load(); }  // diagnostic only
   // Live rate over the last second, updated in loop() (read from ESPHome's loop only).
   // Bus load counts nominal frame bits without stuff bits, so it reads a little low.
@@ -154,22 +147,13 @@ class CanLogger : public Component {
   float sd_sync_max_ms() const { return sd_sync_max_us_.load() / 1000.0f; }
   std::string segment_name() const;
   float segment_mb() const { return seg_cur_bytes_.load() / 1048576.0f; }
-  // UDS flash progress, sniffed on diag_tx_id: the current download (0x34 .. 0x37)
-  int uds_last_service() const { return uds_last_svc_.load(); }  // -1 = none yet
-  uint32_t uds_download_addr() const { return uds_dl_addr_.load(); }
-  uint32_t uds_download_size() const { return uds_dl_size_.load(); }  // from 0x34
-  uint32_t uds_download_bytes() const { return uds_dl_bytes_.load(); }  // 0x36 data so far
-  float uds_progress_pct() const;          // NAN until a 0x34 announced a size
-  uint32_t uds_blocks() const { return uds_blocks_.load(); }
-  float flash_session_s() const;           // this or the last flash session
-  std::string uds_last_service_text() const;  // "0x36 TransferData", "-" if none
 
   // --- controls ---
   void start_capture();   // arm/begin free-run (also called from setup)
   void stop_capture();
-  // Stop capturing, write out everything buffered, end and close the flash
-  // session and segment files. Done in writer_task (it owns the files); poll
-  // shutdown_done(). Capture resumes only after a reboot.
+  // Stop capturing, write out everything buffered and close the segment file.
+  // Done in writer_task (it owns the file); poll shutdown_done(). Capture
+  // resumes only after a reboot.
   void safe_shutdown() { shutdown_req_.store(true); }
   bool shutdown_requested() const { return shutdown_req_.load(); }
   bool shutdown_done() const { return shutdown_done_.load(); }
@@ -185,8 +169,6 @@ class CanLogger : public Component {
   void writer_handle_record_(const Record &r);
   void open_segment_();
   void close_segment_();
-  void open_flash_file_(const Record &trigger);
-  void close_flash_file_();
   void write_header_(void *f);
   bool network_is_connected_hint_();
 
@@ -200,7 +182,6 @@ class CanLogger : public Component {
                         void *ctx);
   void count_id_(uint32_t id);     // capture task: per-ID frame counters
   void update_id_stats_();         // ESPHome loop: unique ids + busiest ids
-  void uds_sniff_(const Record &r);  // writer task: progress of the current download
   bool pop_stage_(RawFrame &out);  // consumer (capture task)
   bool mount_sd_();                // SDMMC slot 0 + FAT, called from writer_task
   void finish_shutdown_();         // writer_task side of safe_shutdown()
@@ -210,9 +191,6 @@ class CanLogger : public Component {
   uint32_t bitrate_{500000};
   std::string sd_path_{"/sdcard"};
   uint32_t ring_mb_{16};
-  uint32_t diag_tx_id_{0};      // 0 = match UDS service on any id
-  uint32_t preroll_ms_{5000};
-  uint32_t postroll_ms_{2000};
   uint32_t seg_bytes_{64u * 1024 * 1024};
   uint16_t http_port_{80};
   bool use_web_{false};            // files served by ESPHome's web server instead
@@ -250,11 +228,9 @@ class CanLogger : public Component {
   std::atomic<uint64_t> overrun_total_{0};
   std::atomic<uint64_t> bytes_written_{0};
   std::atomic<bool> sd_ok_{false};
-  std::atomic<bool> flash_active_{false};
   std::atomic<bool> running_{false};
   std::atomic<bool> shutdown_req_{false};
   std::atomic<bool> shutdown_done_{false};
-  std::atomic<uint32_t> last_flash_bytes_{0};
   std::atomic<uint64_t> bits_total_{0};  // nominal wire bits of captured frames
 
   // rate window (ESPHome loop only)
@@ -283,14 +259,6 @@ class CanLogger : public Component {
   // SD (writer task)
   std::atomic<uint32_t> sd_total_mb_{0}, sd_free0_mb_{0}, sd_sync_max_us_{0};
   std::atomic<uint32_t> seg_index_{0}, seg_cur_bytes_{0};
-  std::atomic<uint64_t> flash_written_{0};  // bytes into flash files since boot
-
-  // UDS sniffing (writer task)
-  std::atomic<int32_t> uds_last_svc_{-1};
-  std::atomic<uint32_t> uds_dl_addr_{0}, uds_dl_size_{0}, uds_dl_bytes_{0}, uds_blocks_{0};
-  std::atomic<uint32_t> sess_start_ms_{0}, sess_end_ms_{0};  // 0 = none / still open
-  uint8_t req34_[32]{};            // 0x34 request being reassembled (ISO-TP)
-  uint8_t req34_len_{0}, req34_have_{0};
 
   // producer-side pending gap flag (set when frames were lost)
   std::atomic<bool> gap_pending_{false};

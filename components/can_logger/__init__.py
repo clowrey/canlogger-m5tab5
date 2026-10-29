@@ -13,9 +13,7 @@ Usage in YAML:
       bitrate: 500000
       sd_path: /sdcard      # mounted by this component (SDMMC slot 0)
       ring_mb: 16
-      diag_tx_id: 0x602     # 0 = detect UDS 0x34/0x37 on any id
-      preroll_ms: 5000
-      postroll_ms: 2000
+      seg_bytes: 67108864   # start a new segNNNN.canbin every 64 MB
 
 The SD pins default to the Tab5's (slot 0: CLK 43, CMD 44, D0-D3 39-42, IO
 power from on-chip LDO 4, as in M5's Tab5 BSP).
@@ -35,9 +33,6 @@ CONF_RX_PIN = "rx_pin"
 CONF_BITRATE = "bitrate"
 CONF_SD_PATH = "sd_path"
 CONF_RING_MB = "ring_mb"
-CONF_DIAG_TX_ID = "diag_tx_id"
-CONF_PREROLL_MS = "preroll_ms"
-CONF_POSTROLL_MS = "postroll_ms"
 CONF_SEG_BYTES = "seg_bytes"
 CONF_HTTP_PORT = "http_port"
 CONF_SD_CLK_PIN = "sd_clk_pin"
@@ -61,9 +56,6 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_SD_PATH, default="/sdcard"): cv.string,
         cv.Optional(CONF_RING_MB, default=16): cv.int_range(min=1, max=28),
-        cv.Optional(CONF_DIAG_TX_ID, default=0): cv.hex_int_range(min=0, max=0x1FFFFFFF),
-        cv.Optional(CONF_PREROLL_MS, default=5000): cv.positive_int,
-        cv.Optional(CONF_POSTROLL_MS, default=2000): cv.positive_int,
         cv.Optional(CONF_SEG_BYTES, default=67108864): cv.positive_int,
         cv.Optional(CONF_HTTP_PORT, default=80): cv.port,
         cv.Optional(CONF_SD_CLK_PIN, default="GPIO43"): pins.internal_gpio_output_pin_number,
@@ -104,9 +96,6 @@ async def to_code(config):
     cg.add(var.set_bitrate(config[CONF_BITRATE]))
     cg.add(var.set_sd_path(config[CONF_SD_PATH]))
     cg.add(var.set_ring_mb(config[CONF_RING_MB]))
-    cg.add(var.set_diag_tx_id(config[CONF_DIAG_TX_ID]))
-    cg.add(var.set_preroll_ms(config[CONF_PREROLL_MS]))
-    cg.add(var.set_postroll_ms(config[CONF_POSTROLL_MS]))
     cg.add(var.set_seg_bytes(config[CONF_SEG_BYTES]))
     cg.add(var.set_http_port(config[CONF_HTTP_PORT]))
     cg.add(
@@ -130,7 +119,7 @@ async def to_code(config):
     esp32.include_builtin_idf_component("esp_driver_twai")
     esp32.include_builtin_idf_component("fatfs")
     esp32.include_builtin_idf_component("wear_levelling")
-    # segNNNN.canbin / flash_<ms>.canbin are not 8.3 names
+    # segNNNN.canbin is not an 8.3 name
     esp32.add_idf_sdkconfig_option("CONFIG_FATFS_LFN_HEAP", True)
     # RX ISR keeps running while the flash cache is off (SPI-flash writes, OTA)
     esp32.add_idf_sdkconfig_option("CONFIG_TWAI_ISR_IN_IRAM", True)

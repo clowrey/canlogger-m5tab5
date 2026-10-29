@@ -4,14 +4,16 @@
     # every frame the CANable sent must be in the Tab5 capture, in order
     python tools/compare_logs.py exact tab5.log run1_sent.log run2_sent.log
 
-    # a carved flash file must be one unbroken stretch of what was sent, with the
-    # pre-roll before 0x34 and the post-roll after 0x37 measured
-    python tools/compare_logs.py slice flash.log uds_sent.log --tx-id 0x602
+    # live bus: every frame another logger saw (e.g. canable_log.py) must be in
+    # the Tab5 capture, in order; frames only the capture has are listed
+    python tools/compare_logs.py subset tab5.log canable.log
 
 Logs are candump -l lines "(ts) iface ID#DATA" as written by canbin2candump.py,
 canable_log.py and the canable_* test senders; '#' lines (meta records) are
 skipped. In exact mode, frames in the capture that match --ignore (e.g. other
-traffic sent outside the logged runs) are left out before comparing.
+traffic sent outside the logged runs) are left out before comparing. In subset
+mode the capture may start earlier and end later than the reference; the
+reference's first frames locate it in the capture.
 """
 import argparse
 import sys
@@ -46,36 +48,37 @@ def exact(args):
     return 1
 
 
-def slice_(args):
-    flash = read(args.flash)
-    sent = read(args.sent)
-    body = [b for _, b in flash]
-    want = [b for _, b in sent]
-    tx = f"{args.tx_id:03X}#"
-    starts = [i for i, b in enumerate(body) if b.startswith(tx) and service(b) == 0x34]
-    print(f"flash file {len(body)} frames; 0x34 trigger frames in it: {len(starts)}")
-    for k in range(len(want) - len(body) + 1):
-        if want[k:k + len(body)] == body:
-            end = k + len(body) - 1
-            trig = next(i for i, b in enumerate(want) if b.startswith(tx) and service(b) == 0x34)
-            done = next(i for i, b in enumerate(want) if b.startswith(tx) and service(b) == 0x37)
-            print(f"CONTIGUOUS: sent frames [{k}..{end}] of {len(want)} "
-                  f"({k} before and {len(want) - 1 - end} after are outside the file)")
-            print(f"starts {sent[trig][0] - sent[k][0]:.2f} s before 0x34, "
-                  f"ends {sent[end][0] - sent[done][0]:.2f} s after 0x37 (sender timestamps)")
-            return 0 if len(starts) == 1 else 1
-    print("NOT a contiguous stretch of what was sent")
-    return 1
-
-
-def service(body):
-    """UDS service byte of an ISO-TP single or first frame, else None."""
-    data = bytes.fromhex(body.split("#")[1]) if not body.endswith("#R") else b""
-    if len(data) >= 2 and data[0] >> 4 == 0:
-        return data[1]
-    if len(data) >= 3 and data[0] >> 4 == 1:
-        return data[2]
-    return None
+def subset(args):
+    got = read(args.capture)
+    ref = read(args.reference)
+    body = [b for _, b in got]
+    want = [b for _, b in ref]
+    k = 16
+    i = next((x for x in range(len(body) - k + 1) if body[x:x + k] == want[:k]), None)
+    if i is None:
+        print(f"the reference's first {k} frames are not in the capture")
+        return 1
+    start, missing, extra = i, 0, []
+    for j, b in enumerate(want):
+        x = i
+        while x < len(body) and x - i < args.window and body[x] != b:
+            x += 1
+        if x >= len(body) or body[x] != b:
+            missing += 1
+            if missing <= 5:
+                print(f"  reference frame {j} not in the capture: {b}")
+            continue
+        if x > i:
+            extra.append((x - i, ref[j][0] - ref[0][0]))
+        i = x + 1
+    print(f"reference {len(want)} frames; capture {i - start} frames over the same stretch")
+    print(f"reference frames missing from the capture: {missing}")
+    print(f"frames only in the capture: {sum(n for n, _ in extra)} in {len(extra)} bursts"
+          + (" (at s into the reference: " + ", ".join(f"{n} @ {t:.1f}" for n, t in extra[:20])
+             + (" ..." if len(extra) > 20 else "") + ")" if extra else ""))
+    if missing == 0:
+        print("SUBSET: every reference frame is in the capture, same order")
+    return 0 if missing == 0 else 1
 
 
 def main():
@@ -85,12 +88,13 @@ def main():
     e.add_argument("capture")
     e.add_argument("sent", nargs="+")
     e.add_argument("--ignore", nargs="*", default=[], metavar="ID#DATA")
-    s = sub.add_parser("slice")
-    s.add_argument("flash")
-    s.add_argument("sent")
-    s.add_argument("--tx-id", type=lambda x: int(x, 0), default=0x602)
+    s = sub.add_parser("subset")
+    s.add_argument("capture")
+    s.add_argument("reference")
+    s.add_argument("--window", type=int, default=5000,
+                   help="how far ahead in the capture to look for the next reference frame")
     args = ap.parse_args()
-    sys.exit(exact(args) if args.mode == "exact" else slice_(args))
+    sys.exit(exact(args) if args.mode == "exact" else subset(args))
 
 
 if __name__ == "__main__":
