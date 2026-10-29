@@ -1,7 +1,7 @@
 # canlogger-m5tab5
 
-Lossless CAN logger on an **M5Stack Tab5 (ESP32-P4)** with an **M5 Unit CAN
-(CA-IS3050G)**: it records every frame on the bus to the SD card, continuously,
+Lossless CAN logger on an **[M5Stack Tab5 (ESP32-P4)](https://shop.m5stack.com/products/m5stack-tab5-iot-development-kit-esp32-p4)** with an
+**[M5 Unit CAN (CA-IS3050G)](https://shop.m5stack.com/products/canbus-unitca-is3050g)**: it records every frame on the bus to the SD card, continuously,
 for as long as it runs. It runs as an ESPHome external component, so the same
 device streams status to Home Assistant, serves its capture files over HTTP and
 shows live stats on the Tab5 screen.
@@ -59,8 +59,8 @@ docs/TESTING.md            desk test procedure and results
 
 | Part | Notes |
 |---|---|
-| M5Stack Tab5, **ST7123** display revision | Written for this revision (M5 sells three). If the screen stays black with no error, try display model `M5STACK-TAB5-ST7121`. |
-| M5 Unit CAN (CA-IS3050G) on **Port A** | Yellow G53, white G54. `rx_pin: GPIO54`; if frames stay at 0 on a live bus, use `GPIO53`. No `tx_pin` is configured, so wiring it the other way round can't drive the bus. |
+| [M5Stack Tab5](https://shop.m5stack.com/products/m5stack-tab5-iot-development-kit-esp32-p4), **ST7123** display revision | Written for this revision (M5 sells three). If the screen stays black with no error, try display model `M5STACK-TAB5-ST7121`. |
+| [M5 Unit CAN (CA-IS3050G)](https://shop.m5stack.com/products/canbus-unitca-is3050g) on **Port A** | Sold by M5 as "CANBus Unit (CA-IS3050G)", SKU U085. Yellow G53, white G54. `rx_pin: GPIO54`; if frames stay at 0 on a live bus, use `GPIO53`. No `tx_pin` is configured, so wiring it the other way round can't drive the bus. |
 | microSD card | FAT32. The component mounts it and never formats it. |
 | Separate 5 V supply | A PC USB port wasn't enough: Wi-Fi failed once the SD card was mounted. |
 | CANable 2.0 (optional) | Reference logger and desk test sender. Needs gs_usb firmware for listen-only; see [canable-fw](canable-fw/README.md). |
