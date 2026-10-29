@@ -99,10 +99,19 @@ The flash test found two carving bugs, now fixed: the `0x34` trigger frame was
 written twice, and the pre-roll was limited only by frame count, so on a quiet
 bus it reached back ~30 minutes.
 
+On a live vehicle bus (2026-10-29, Model 3/Y-type traffic, 283 ids, ~2,280
+frames/s, ~47 % load before stuff bits, frames down to 95 µs apart), the Tab5
+and the CANable logged side by side, compared with the CANable window lined up
+inside the Tab5 segment:
+
+| Test | Result |
+|---|---|
+| 60 s, CANable with the old one-read-at-a-time loop | All 136,975 CANable frames in the Tab5 capture, same order; the Tab5 had 196 more (27 bursts the CANable dropped, each in a gap of its own timestamps). Tab5 0 overruns, largest Tab5 gap 3.3 ms |
+| 120 s, CANable with 256 queued USB transfers | 273,389 frames, identical to the Tab5 capture frame for frame; CANable overflows 0, Tab5 overruns 0 |
+
 Not yet tested: above ~65 % bus load (the CANable sends about 2,500-2,700
 frames/s at most; more than 32 frames in flight makes it drop its own read-back
-copies), the CANable logging someone else's traffic at high load, and a real
-ECU flash.
+copies) and a real ECU flash.
 
 ## The CANable as reference logger
 
@@ -116,3 +125,11 @@ ECU flash.
 - python `gs_usb` only has bit timings for 48 and 80 MHz CAN clocks; for others
   (Elmue's firmware runs at 160 MHz) the script derives the timing itself,
   picking the sample point closest to 87.5 %.
+- python `gs_usb` reads one frame per USB transfer, ~0.3 ms per round trip on
+  Windows, and the CANable holds only a few frames meanwhile: on a busy bus it
+  overflowed and dropped bursts of 30-40 frames. The script keeps 256 bulk
+  transfers queued instead (libusb async on pyusb's handle). The CANable reports
+  its own drops as RX-overflow error frames, shown as "CANable overflows": the
+  log is a complete reference only while that stays 0.
+- A frame left queued from the previous run (minutes-old timestamp) is drained
+  before logging starts.

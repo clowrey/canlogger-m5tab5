@@ -15,17 +15,23 @@ Two firmwares:
                         CANable ACKs every frame like an ECU would. Needs
                         --allow-ack; timestamps are taken on the PC.
 
-Stop with Ctrl+C. The file is flushed every second.
+Stop with Ctrl+C. The file is flushed every second. "CANable overflows" counts
+the times the CANable reported dropping frames itself (its queue to the PC ran
+full); the log is only a complete reference while that stays 0.
 Needs: pip install gs_usb libusb-package pyserial
 """
 import argparse
+import queue
 import sys
+import threading
 import time
 
 CAN_EFF_FLAG = 0x80000000
 CAN_RTR_FLAG = 0x40000000
 CAN_ERR_FLAG = 0x20000000
 CAN_EFF_MASK = 0x1FFFFFFF
+CAN_ERR_CRTL = 0x00000004            # error frame class: controller problem, details in data[1]
+CAN_ERR_CRTL_RX_OVERFLOW = 0x01
 
 SLCAN_BITRATES = {10000: 0, 20000: 1, 50000: 2, 100000: 3, 125000: 4,
                   250000: 5, 500000: 6, 750000: 7, 1000000: 8}
@@ -112,6 +118,105 @@ def set_bitrate(dev, bitrate, sample_point=0.875):
     return True
 
 
+def drain_gs_usb(dev):
+    """Drop frames still queued from an earlier run (they carry stale timestamps)."""
+    import usb.core
+
+    dropped = 0
+    while True:
+        try:
+            dev.gs_usb.read(0x81, 64, 20)
+        except usb.core.USBError:     # timeout: nothing left
+            return dropped
+        dropped += 1
+
+
+class UsbReader:
+    """Keeps n bulk IN transfers queued on the CANable (libusb async, on the
+    handle pyusb already has open) and puts each received packet on q.
+
+    gs_usb's read() submits one transfer at a time, and on Windows each round
+    trip takes ~0.3 ms (a few ms at worst). The CANable holds only a few frames
+    meanwhile, so on a busy bus (~2,300 frames/s, bursts 95 us apart) it
+    overflowed and dropped bursts of 30-40 frames. With transfers waiting, each
+    frame leaves on the next USB poll and the PC can fall n frames behind
+    (n=64, ~28 ms of that bus, still lost one burst a minute to Windows
+    scheduling; 256 gives ~110 ms)."""
+
+    def __init__(self, dev, size, q, n=256):
+        import ctypes
+        import usb.backend.libusb1 as lu
+
+        self.ct, self.lu, self.q = ctypes, lu, q
+        res = dev.gs_usb._ctx
+        res.managed_claim_interface(dev.gs_usb, 0)   # start()'s USB reset closed the handle
+        self.lib, self.usb_ctx = res.backend.lib, res.backend.ctx
+        self.lib.libusb_cancel_transfer.argtypes = [lu._libusb_transfer_p]
+        self.lib.libusb_handle_events_timeout.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.stopping = False
+        self.pending = 0
+        self.cb = lu._libusb_transfer_cb_fn_p(self._done)   # must outlive the transfers
+        self.bufs, self.xfers = [], []
+        for _ in range(n):
+            buf = ctypes.create_string_buffer(size)
+            t = self.lib.libusb_alloc_transfer(0)
+            c = t.contents
+            c.dev_handle = res.handle.handle
+            c.endpoint = 0x81
+            c.type = 2                      # LIBUSB_TRANSFER_TYPE_BULK
+            c.timeout = 0
+            c.length = size
+            c.callback = self.cb
+            c.buffer = ctypes.cast(buf, ctypes.c_void_p)
+            self.bufs.append(buf)
+            self.xfers.append(t)
+        for t in self.xfers:
+            self._submit(t)
+        self.thread = threading.Thread(target=self._events, daemon=True)
+        self.thread.start()
+
+    def _submit(self, t):
+        rc = self.lib.libusb_submit_transfer(t)
+        if rc:
+            self.q.put(IOError(f"libusb_submit_transfer failed ({rc})"))
+        else:
+            self.pending += 1
+
+    def _done(self, t):
+        # runs in _events' thread, inside libusb_handle_events_timeout
+        c = t.contents
+        self.pending -= 1
+        if c.status == self.lu.LIBUSB_TRANSFER_COMPLETED:
+            self.q.put(self.ct.string_at(c.buffer, c.actual_length))
+        elif c.status != self.lu.LIBUSB_TRANSFER_CANCELLED:
+            self.q.put(IOError(f"USB transfer failed (libusb transfer status {c.status})"))
+            self.stopping = True
+            return
+        if not self.stopping:
+            self._submit(t)
+
+    def _events(self):
+        class Timeval(self.ct.Structure):
+            _fields_ = [("tv_sec", self.ct.c_long), ("tv_usec", self.ct.c_long)]
+
+        tv = Timeval(0, 100000)
+        while not self.stopping:
+            self.lib.libusb_handle_events_timeout(self.usb_ctx, self.ct.byref(tv))
+        # cancel from this thread so no callback can resubmit behind our back
+        for t in self.xfers:
+            self.lib.libusb_cancel_transfer(t)
+        deadline = time.time() + 2
+        while self.pending and time.time() < deadline:
+            self.lib.libusb_handle_events_timeout(self.usb_ctx, self.ct.byref(tv))
+
+    def stop(self):
+        self.stopping = True
+        self.thread.join(3)
+        if not self.pending:
+            for t in self.xfers:
+                self.lib.libusb_free_transfer(t)
+
+
 def run_gs_usb(dev, args, out, stats):
     from gs_usb.constants import GS_CAN_MODE_HW_TIMESTAMP, GS_CAN_MODE_LISTEN_ONLY
     from gs_usb.gs_usb_frame import GsUsbFrame
@@ -123,6 +228,9 @@ def run_gs_usb(dev, args, out, stats):
         dev.stop()
     except Exception:
         pass
+    stale = drain_gs_usb(dev)
+    if stale:
+        print(f"dropped {stale} frame(s) left over from an earlier run", file=sys.stderr)
     if not set_bitrate(dev, args.bitrate):
         sys.exit(f"gs_usb: bitrate {args.bitrate} not supported")
     flags = GS_CAN_MODE_LISTEN_ONLY
@@ -135,15 +243,24 @@ def run_gs_usb(dev, args, out, stats):
 
     clock = FrameClock(hw_ts)
     frame = GsUsbFrame()
+    q = queue.SimpleQueue()
+    reader = UsbReader(dev, frame.__sizeof__(hw_ts), q)
     try:
         while True:
             stats.tick(out)
-            if not dev.read(frame, 200):
+            try:
+                raw = q.get(timeout=0.2)
+            except queue.Empty:
                 continue
+            if isinstance(raw, Exception):
+                sys.exit(f"gs_usb read failed: {raw}")
+            GsUsbFrame.unpack_into(frame, raw, hw_ts)
             if frame.echo_id != 0xFFFFFFFF:     # echo of our own TX (never in listen-only)
                 continue
             if frame.can_id & CAN_ERR_FLAG:
                 stats.errors += 1
+                if frame.can_id & CAN_ERR_CRTL and frame.data[1] & CAN_ERR_CRTL_RX_OVERFLOW:
+                    stats.overflows += 1
                 continue
             ts = clock.stamp(frame.timestamp_us)
             dlc = min(frame.can_dlc, 8)
@@ -153,6 +270,7 @@ def run_gs_usb(dev, args, out, stats):
                                    bytes(frame.data[:dlc])))
             stats.frames += 1
     finally:
+        reader.stop()
         dev.stop()
 
 
@@ -224,7 +342,7 @@ def run_slcan(port, args, out, stats):
 
 class Stats:
     def __init__(self, every, duration):
-        self.frames = self.errors = self.junk = 0
+        self.frames = self.errors = self.overflows = self.junk = 0
         self.every = every
         self.duration = duration
         self.t0 = self.t_flush = self.t_print = time.time()
@@ -240,7 +358,8 @@ class Stats:
         if now - self.t_print >= self.every:
             fps = (self.frames - self.last_frames) / (now - self.t_print)
             print(f"{now - self.t0:7.0f} s  frames {self.frames}  ({fps:.0f}/s)  "
-                  f"error frames {self.errors}  unparsed {self.junk}", file=sys.stderr)
+                  f"error frames {self.errors}  CANable overflows {self.overflows}  "
+                  f"unparsed {self.junk}", file=sys.stderr)
             self.t_print, self.last_frames = now, self.frames
 
 
@@ -282,8 +401,8 @@ def main():
                 run_slcan(port, args, out, stats)
         except KeyboardInterrupt:
             pass
-    print(f"stopped: {stats.frames} frames, {stats.errors} error frames -> {name}",
-          file=sys.stderr)
+    print(f"stopped: {stats.frames} frames, {stats.errors} error frames, "
+          f"{stats.overflows} CANable overflows -> {name}", file=sys.stderr)
 
 
 if __name__ == "__main__":
