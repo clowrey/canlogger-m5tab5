@@ -101,6 +101,35 @@ fine as long as the CANable reported overflows for them (see below). If the bus
 carried a firmware download, `reassemble_uds.py` on the segment should say
 MATCH.
 
+## 5. The CAN FD channel, on the desk
+
+With the CANable in the Tab5's USB-A port and nothing on its CAN wires, a test
+build sends frames through the CANable's **internal loopback**. Its FDCAN never
+drives the bus in that mode. Add this to `fd_channel:` and flash:
+
+```yaml
+    test_loopback_frames: 200000
+```
+
+After the CANable starts, the Tab5 sends that many numbered frames on two ids:
+`0x1FD` (standard) and `0x1FD1FD0` (extended). They cycle through every FD
+length (4-64 bytes), with BRS, and every 17th is a classic 8-byte frame. At
+most 32 are in flight. The log then says:
+
+```
+FD loopback test: sent 200000, received 200000, sequence errors 0, 6466 frames/s
+```
+
+That checks the USB path. For the SD path, fetch the segment and check that the
+bus-1 frames hold every number once, in order:
+
+```bash
+python scripts/canbin2candump.py seg0046.canbin --bus 1 -o fd.log
+```
+
+Remove `test_loopback_frames` again for real use: it puts the CANable in
+loopback instead of listen-only.
+
 ## Results
 
 Desk (2026-10-28, ESPHome 2026.7.2):
@@ -126,6 +155,16 @@ with `compare_logs.py subset`:
 | 60 s, CANable with the old one-read-at-a-time loop | All 136,975 CANable frames in the Tab5 capture, same order; the Tab5 had 196 more, in 27 bursts the CANable dropped. Tab5: 0 overruns, largest gap between frames 3.3 ms |
 | 120 s, CANable with 256 queued USB transfers | 273,389 frames, identical frame for frame; CANable overflows 0, Tab5 overruns 0 |
 | 22 min across an ECU firmware update over UDS (diagnostic traffic to a dozen ECUs, one ~43 KB download), spanning a segment rotation | All 2,740,311 CANable frames in the Tab5 capture, same order; the Tab5 had 144 more, in the CANable's one overflow (a ~70 ms gap). Tab5: 0 overruns. The download rebuilt from the Tab5 segment and from the CANable log (repacked as `.canbin`): identical images (SHA-256), size MATCH |
+
+CAN FD channel, desk loopback (2026-10-29, CANable 2.0 nano with Elmue's
+firmware on USB-A, 500 kbit/s / 2 Mbit/s):
+
+| Test | Result |
+|---|---|
+| 200,000 numbered frames through internal loopback, 4-48 bytes (the first test build's pattern skipped 64) plus classic 8-byte, std and ext ids | Sent 200,000, received 200,000, 0 sequence errors, ~6,466 frames/s at the USB side. In the segment (`CANBIN02`, fetched with resume): all 200,000 on bus 1, in order, payloads, flags and ids correct, 0 GAP flags, 6,652 frames/s by timestamp. FD overruns 0, FD staging peak 24 of 2,048 |
+
+Not yet tested on the FD channel: 64-byte frames (the sender now includes them),
+a live FD bus, and a flash write (OTA, settings save) during FD capture.
 
 Not yet tested: above ~65 % bus load (the CANable sends about 2,500-2,700
 frames/s at most; more than 32 frames in flight makes it drop its own read-back

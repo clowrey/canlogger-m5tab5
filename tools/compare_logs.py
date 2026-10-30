@@ -19,24 +19,31 @@ import argparse
 import sys
 
 
-def read(path):
-    """[(ts, 'ID#DATA')] for every frame line."""
+def read(path, iface=None):
+    """[(ts, 'ID#DATA')] for every frame line (only `iface`'s, if given)."""
     out = []
     for line in open(path):
         if line.startswith("("):
-            ts, _iface, body = line.split(" ", 2)
-            out.append((float(ts[1:-1]), body.strip()))
+            ts, if_, body = line.split(" ", 2)
+            if iface is None or if_ == iface:
+                out.append((float(ts[1:-1]), body.strip()))
     return out
 
 
+def data_len(body):
+    """Data bytes of 'ID#DATA' or CAN FD 'ID##<flags>DATA'."""
+    d = body.split(" ")[0].split("#", 1)[1]
+    return len(d[2:] if d.startswith("#") else d) // 2
+
+
 def exact(args):
-    got = [b for _, b in read(args.capture) if b not in set(args.ignore)]
+    got = [b for _, b in read(args.capture, args.iface) if b not in set(args.ignore)]
     want = [b for p in args.sent for _, b in read(p)]
     print(f"capture {len(got)} frames, sent {len(want)}")
     if got == want:
         ext = sum(1 for f in want if len(f.split("#")[0]) == 8)
         rtr = sum(1 for f in want if f.endswith("#R"))
-        lens = sorted({len(f.split("#")[1]) // 2 for f in want if not f.endswith("#R")})
+        lens = sorted({data_len(f) for f in want if not f.endswith("#R")})
         print(f"IDENTICAL: same frames in the same order ({ext} extended ids, {rtr} remote "
               f"frames, data lengths {lens})")
         return 0
@@ -49,7 +56,7 @@ def exact(args):
 
 
 def subset(args):
-    got = read(args.capture)
+    got = read(args.capture, args.iface)
     ref = read(args.reference)
     body = [b for _, b in got]
     want = [b for _, b in ref]
@@ -83,6 +90,8 @@ def subset(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--iface", help="use only this interface's lines from the capture "
+                    "(e.g. can1 for the FD channel of a CANBIN02 capture)")
     sub = ap.add_subparsers(dest="mode", required=True)
     e = sub.add_parser("exact")
     e.add_argument("capture")

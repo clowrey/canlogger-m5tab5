@@ -1,6 +1,8 @@
 # Plan: a second, CAN FD channel
 
-Status: plan only, nothing built yet (2026-10-29).
+Status (2026-10-29): **option B is built** (`fd_channel: driver: gs_usb`; see
+the README's "Second channel" section and docs/TESTING.md section 5). Option A
+is not started.
 
 Goal: log a CAN FD bus alongside the existing classic channel, both at full
 load, listen-only, with every lost frame counted, into the same capture files

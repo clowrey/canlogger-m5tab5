@@ -78,6 +78,20 @@ bool CanLogger::ring_push_(const Record &r) {
   return true;
 }
 
+bool CanLogger::ring_push_n_(const Record *r, uint32_t n) {
+  uint32_t head = ring_head_.load(std::memory_order_relaxed);
+  uint32_t tail = ring_tail_.load(std::memory_order_acquire);
+  uint32_t used = (head - tail) & ring_mask_;
+  if (used + n >= ring_cap_)
+    return false;  // no room for the whole frame: caller counts it as loss
+  for (uint32_t i = 0; i < n; i++)
+    ring_[(head + i) & ring_mask_] = r[i];
+  ring_head_.store(head + n, std::memory_order_release);
+  if (used + n > ring_peak_.load(std::memory_order_relaxed))
+    ring_peak_.store(used + n, std::memory_order_relaxed);
+  return true;
+}
+
 bool CanLogger::ring_pop_(Record &out) {
   uint32_t tail = ring_tail_.load(std::memory_order_relaxed);
   uint32_t head = ring_head_.load(std::memory_order_acquire);
@@ -232,9 +246,52 @@ void CanLogger::setup() {
                           4096, this, 20, nullptr, 1);
   xTaskCreatePinnedToCore([](void *a) { ((CanLogger *) a)->writer_task(); }, "can_wr",
                           8192, this, 5, nullptr, 0);
+#ifdef USE_CAN_LOGGER_GSUSB
+  if (!gs_usb_.start())
+    ESP_LOGE(TAG, "FD channel not started");  // channel 0 is unaffected
+#endif
 
   this->start_capture();
 }
+
+#ifdef USE_CAN_LOGGER_GSUSB
+// FD staging (PSRAM) -> PSRAM ring as bus-1 records: a head record, then the
+// payload beyond 8 bytes in raw continuation records, pushed all or nothing.
+void CanLogger::drain_fd_(bool &got) {
+  FdFrame f;
+  Record recs[4];
+  while (gs_usb_.pop(f)) {
+    got = true;
+    if (!running_.load())
+      continue;
+    std::memset(recs, 0, sizeof(recs));
+    Record &h = recs[0];
+    h.ts_us = f.ts_us;
+    h.id = f.id;
+    h.dlc = f.len;
+    h.bus = 1;
+    h.flags = ((f.flags & FD_F_FDF) ? REC_FLAG_FDF : 0) | ((f.flags & FD_F_BRS) ? REC_FLAG_BRS : 0) |
+              ((f.flags & FD_F_ESI) ? REC_FLAG_ESI : 0);
+    if ((f.flags & FD_F_GAP) || fd_gap_pending_)
+      h.flags |= REC_FLAG_GAP;
+    uint8_t len = (f.id & (1u << 30)) ? 0 : f.len;  // RTR: no payload
+    std::memcpy(h.data, f.data, len < 8 ? len : 8);
+    uint32_t n = 1;
+    if (len > 8) {
+      h.cont = (uint8_t) ((len - 8 + sizeof(Record) - 1) / sizeof(Record));
+      std::memcpy(&recs[1], f.data + 8, len - 8);
+      n += h.cont;
+    }
+    if (!ring_push_n_(recs, n)) {
+      fd_ring_overruns_.fetch_add(1);
+      fd_gap_pending_ = true;
+    } else {
+      fd_gap_pending_ = false;
+      fd_frames_total_.fetch_add(1);
+    }
+  }
+}
+#endif
 
 // ---- capture task (core 1): staging ring -> PSRAM ring --------------------
 void CanLogger::capture_task() {
@@ -271,6 +328,9 @@ void CanLogger::capture_task() {
         count_id_(rf.id);
       }
     }
+#ifdef USE_CAN_LOGGER_GSUSB
+    drain_fd_(got);
+#endif
     // fold any ISR-side staging overflow into the integrity gate
     uint32_t so = stage_overrun_.exchange(0);
     if (so)
@@ -325,6 +385,12 @@ void CanLogger::write_header_(void *fp) {
   h.rec_size = sizeof(Record);
   h.bitrate = bitrate_;
   h.epoch_us = epoch_us_;
+#ifdef USE_CAN_LOGGER_GSUSB
+  std::memcpy(h.magic, "CANBIN02", 8);  // bus-1 records and continuations
+  h.version = 2;
+  h.flags = gs_usb_.nominal_bitrate();
+  h.reserved = gs_usb_.data_bitrate();
+#endif
   fwrite(&h, sizeof(h), 1, (FILE *) fp);
 }
 
@@ -355,15 +421,21 @@ void CanLogger::close_segment_() {
   }
 }
 
-// Every record goes to the current segment, which rotates at seg_bytes.
+// Every record goes to the current segment, which rotates at seg_bytes, but
+// never between an FD frame's head record and its continuations.
 void CanLogger::writer_handle_record_(const Record &r) {
+  static uint8_t cont_left = 0;  // continuation records still to come
+  if (cont_left)
+    cont_left--;  // raw payload, not a record
+  else
+    cont_left = r.cont;
   if (g_seg_file == nullptr)
     return;
   fwrite(&r, sizeof(Record), 1, g_seg_file);
   g_seg_bytes_written += sizeof(Record);
   seg_cur_bytes_.store(g_seg_bytes_written);
   bytes_written_.fetch_add(sizeof(Record));
-  if (g_seg_bytes_written >= seg_bytes_) {
+  if (g_seg_bytes_written >= seg_bytes_ && cont_left == 0) {
     close_segment_();
     open_segment_();
   }
@@ -573,6 +645,22 @@ float CanLogger::sd_free_gb() const {
   return written >= free ? 0 : (free - written) / 1073741824.0f;
 }
 
+#ifdef USE_CAN_LOGGER_GSUSB
+bool CanLogger::fd_enabled() const { return true; }
+float CanLogger::fd_bus_load_pct() const { return gs_usb_.bus_load_pct(); }
+uint32_t CanLogger::fd_overruns() const { return gs_usb_.loss_events() + fd_ring_overruns_.load(); }
+const char *CanLogger::fd_state() const { return gs_usb_.state(); }
+std::string CanLogger::fd_adapter() const { return gs_usb_.adapter(); }
+uint32_t CanLogger::fd_staging_peak() const { return gs_usb_.staged_peak(); }
+#else
+bool CanLogger::fd_enabled() const { return false; }
+float CanLogger::fd_bus_load_pct() const { return 0; }
+uint32_t CanLogger::fd_overruns() const { return 0; }
+const char *CanLogger::fd_state() const { return "off"; }
+std::string CanLogger::fd_adapter() const { return "-"; }
+uint32_t CanLogger::fd_staging_peak() const { return 0; }
+#endif
+
 std::string CanLogger::segment_name() const {
   if (!sd_ok_.load())
     return "-";
@@ -620,6 +708,32 @@ static esp_err_t http_dl(httpd_req_t *req) {
     return ESP_FAIL;
   }
   httpd_resp_set_type(req, "application/octet-stream");
+  httpd_resp_set_hdr(req, "Accept-Ranges", "bytes");
+  // The response is chunked, so the size goes in its own header for the client
+  // to check it got everything. Static: httpd keeps the pointers until it sends.
+  static char size_hdr[24], content_range[64];
+  struct stat st;
+  long size = stat(path, &st) == 0 ? (long) st.st_size : 0;
+  snprintf(size_hdr, sizeof(size_hdr), "%ld", size);
+  httpd_resp_set_hdr(req, "X-File-Size", size_hdr);
+  // "Range: bytes=N-" resumes a download that a Wi-Fi drop cut off
+  char range[48] = {0};
+  long start = 0;
+  if (httpd_req_get_hdr_value_str(req, "Range", range, sizeof(range)) == ESP_OK &&
+      sscanf(range, "bytes=%ld-", &start) == 1 && start > 0) {
+    if (start >= size) {
+      fclose(f);
+      snprintf(content_range, sizeof(content_range), "bytes */%ld", size);
+      httpd_resp_set_status(req, "416 Range Not Satisfiable");
+      httpd_resp_set_hdr(req, "Content-Range", content_range);
+      httpd_resp_send(req, nullptr, 0);
+      return ESP_OK;
+    }
+    fseek(f, start, SEEK_SET);
+    snprintf(content_range, sizeof(content_range), "bytes %ld-%ld/%ld", start, size - 1, size);
+    httpd_resp_set_status(req, "206 Partial Content");
+    httpd_resp_set_hdr(req, "Content-Range", content_range);
+  }
   static char buf[4096];
   size_t n;
   while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
@@ -655,17 +769,21 @@ void CanLogger::loop() {
   // frame rate and bus load over ~1 s windows; the capture task only adds counters
   int64_t now = esp_timer_get_time();
   if (rate_t_ == 0 || now - rate_t_ >= 1000000) {
-    uint64_t f = frames_total_.load(), b = bits_total_.load();
+    uint64_t f = frames_total_.load(), b = bits_total_.load(), fd = fd_frames_total_.load();
     if (rate_t_ != 0) {
       float dt = (now - rate_t_) / 1e6f;
       frame_rate_ = (f - rate_frames_) / dt;
       bus_load_ = 100.0f * (b - rate_bits_) / dt / bitrate_;
       if (frame_rate_ > peak_rate_)
         peak_rate_ = frame_rate_;
+      fd_rate_ = (fd - fd_rate_frames_) / dt;
+      if (fd_rate_ > fd_peak_rate_)
+        fd_peak_rate_ = fd_rate_;
     }
     rate_t_ = now;
     rate_frames_ = f;
     rate_bits_ = b;
+    fd_rate_frames_ = fd;
   }
   if (ids_t_ == 0 || now - ids_t_ >= 2000000)
     update_id_stats_();
@@ -705,6 +823,12 @@ void CanLogger::dump_config() {
   ESP_LOGCONFIG(TAG, "  overruns=%llu bus_errors=%llu",
                 (unsigned long long) overrun_total_.load(),
                 (unsigned long long) bus_errors_.load());
+#ifdef USE_CAN_LOGGER_GSUSB
+  ESP_LOGCONFIG(TAG, "  FD channel (bus 1): gs_usb on USB-A, %u/%u bit/s%s, state %s, adapter %s",
+                (unsigned) gs_usb_.nominal_bitrate(), (unsigned) gs_usb_.data_bitrate(),
+                gs_usb_.test_mode() ? " INTERNAL LOOPBACK TEST" : " listen-only", gs_usb_.state(),
+                gs_usb_.adapter().c_str());
+#endif
 }
 
 }  // namespace can_logger

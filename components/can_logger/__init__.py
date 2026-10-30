@@ -14,6 +14,10 @@ Usage in YAML:
       sd_path: /sdcard      # mounted by this component (SDMMC slot 0)
       ring_mb: 16
       seg_bytes: 67108864   # start a new segNNNN.canbin every 64 MB
+      fd_channel:           # optional second, CAN FD channel; omit for classic only
+        driver: gs_usb      # CANable 2.0 with Elmue's firmware on the USB-A port
+        bitrate: 500000
+        data_bitrate: 2000000   # 0 = classic CAN on this channel
 
 The SD pins default to the Tab5's (slot 0: CLK 43, CMD 44, D0-D3 39-42, IO
 power from on-chip LDO 4, as in M5's Tab5 BSP).
@@ -42,6 +46,29 @@ CONF_SD_D1_PIN = "sd_d1_pin"
 CONF_SD_D2_PIN = "sd_d2_pin"
 CONF_SD_D3_PIN = "sd_d3_pin"
 CONF_SD_LDO_CHANNEL = "sd_ldo_channel"
+CONF_FD_CHANNEL = "fd_channel"
+CONF_DRIVER = "driver"
+CONF_DATA_BITRATE = "data_bitrate"
+CONF_SAMPLE_POINT = "sample_point"
+CONF_DATA_SAMPLE_POINT = "data_sample_point"
+CONF_TEST_LOOPBACK_FRAMES = "test_loopback_frames"
+
+FD_CHANNEL_SCHEMA = cv.Schema(
+    {
+        # gs_usb: a CANable 2.0 (STM32G4) with Elmue's CANable 2.5 firmware on
+        # the USB-A host port. (An MCP2518FD on SPI is planned, docs/CANFD-PLAN.md.)
+        cv.Optional(CONF_DRIVER, default="gs_usb"): cv.one_of("gs_usb", lower=True),
+        cv.Optional(CONF_BITRATE, default=500000): cv.int_range(min=10000, max=1000000),
+        cv.Optional(CONF_DATA_BITRATE, default=2000000): cv.Any(
+            cv.one_of(0, int=True), cv.int_range(min=500000, max=8000000)
+        ),
+        cv.Optional(CONF_SAMPLE_POINT, default="80%"): cv.percentage,
+        cv.Optional(CONF_DATA_SAMPLE_POINT, default="75%"): cv.percentage,
+        # Desk test only: the adapter goes into internal loopback (it never drives
+        # the bus) and the Tab5 sends this many numbered frames through it.
+        cv.Optional(CONF_TEST_LOOPBACK_FRAMES, default=0): cv.int_range(min=0, max=100000000),
+    }
+)
 
 can_logger_ns = cg.esphome_ns.namespace("can_logger")
 CanLogger = can_logger_ns.class_("CanLogger", cg.Component)
@@ -65,6 +92,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_SD_D2_PIN, default="GPIO41"): pins.internal_gpio_output_pin_number,
         cv.Optional(CONF_SD_D3_PIN, default="GPIO42"): pins.internal_gpio_output_pin_number,
         cv.Optional(CONF_SD_LDO_CHANNEL, default=4): cv.int_range(min=0, max=4),
+        cv.Optional(CONF_FD_CHANNEL): FD_CHANNEL_SCHEMA,
         # With ESPHome's web_server configured, /files and /dl are served there
         # (its port and auth) and http_port is unused; HA then links the device.
         cv.OnlyWith(CONF_WEB_SERVER_BASE_ID, "web_server_base"): cv.use_id(
@@ -124,3 +152,25 @@ async def to_code(config):
     # RX ISR keeps running while the flash cache is off (SPI-flash writes, OTA)
     esp32.add_idf_sdkconfig_option("CONFIG_TWAI_ISR_IN_IRAM", True)
     esp32.add_idf_sdkconfig_option("CONFIG_TWAI_ISR_CACHE_SAFE", True)
+    # The P4 heap can place the 3.5 KB main-task stack in its 8 KB SPM (TCM);
+    # the first flash mapping (ESPHome opening NVS) then asserts in
+    # esp_task_stack_is_sane_cache_disabled() and the board boot-loops. Seen
+    # with the fd_channel build. A stack bigger than the SPM can't land there.
+    esp32.add_idf_sdkconfig_option("CONFIG_ESP_MAIN_TASK_STACK_SIZE", 9216)
+
+    if fd := config.get(CONF_FD_CHANNEL):
+        cg.add_define("USE_CAN_LOGGER_FD")
+        cg.add_define("USE_CAN_LOGGER_GSUSB")
+        cg.add(
+            var.set_fd_gs_usb(
+                fd[CONF_BITRATE],
+                fd[CONF_DATA_BITRATE],
+                fd[CONF_SAMPLE_POINT],
+                fd[CONF_DATA_SAMPLE_POINT],
+                fd[CONF_TEST_LOOPBACK_FRAMES],
+            )
+        )
+        # USB host library (built into IDF 5.x, stripped unless asked for);
+        # more of the controller's FIFO for IN transfers
+        esp32.include_builtin_idf_component("usb")
+        esp32.add_idf_sdkconfig_option("CONFIG_USB_HOST_HW_BUFFER_BIAS_IN", True)

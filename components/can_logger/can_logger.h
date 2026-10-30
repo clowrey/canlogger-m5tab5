@@ -10,6 +10,8 @@
 //   writer_task (core 0, prio 5): drains the PSRAM ring -> SD, every frame to a
 //       rotating segment file.
 //   ESPHome loop(): rate/bus-load maths and stats for entities and the screen.
+//   Optional second channel (fd_channel:, USE_CAN_LOGGER_FD): a CAN FD adapter
+//       on USB (gs_usb_fd.h) whose frames the capture task drains too, as bus 1.
 
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
@@ -22,6 +24,9 @@
 
 #ifdef USE_CAN_LOGGER_WEB
 #include "esphome/components/web_server_base/web_server_base.h"
+#endif
+#ifdef USE_CAN_LOGGER_GSUSB
+#include "gs_usb_fd.h"
 #endif
 
 namespace esphome {
@@ -40,25 +45,32 @@ class CanFileHandler : public AsyncWebHandler {
 
 // ---- on-disk record format (.canbin), little-endian -----------------------
 // 32-byte file header, then fixed 24-byte records. Keep in lockstep with
-// scripts/canbin2candump.py and scripts/reassemble_uds.py.
+// scripts/canbin.py (used by canbin2candump.py and reassemble_uds.py).
+//
+// CANBIN01 (classic-only build): one record per frame, bus always 0.
+// CANBIN02 (built with fd_channel): the same, plus frames from bus 1 (the FD
+// adapter). A bus-1 frame with more than 8 data bytes is its head record
+// (first 8 bytes in data[], `cont` = number of continuation records) followed
+// by `cont` raw 24-byte records holding the rest of the payload. A segment
+// never ends between a head and its continuations.
 #pragma pack(push, 1)
 struct FileHeader {
-  char magic[8];      // "CANBIN01"
-  uint16_t version;   // 1
+  char magic[8];      // "CANBIN01" / "CANBIN02"
+  uint16_t version;   // 1 / 2
   uint16_t rec_size;  // 24
-  uint32_t bitrate;   // e.g. 500000
+  uint32_t bitrate;   // bus 0, e.g. 500000
   uint64_t epoch_us;  // wall epoch of ts=0, or 0 if boot-relative
-  uint32_t flags;     // reserved
-  uint32_t reserved;
+  uint32_t flags;     // v1: reserved; v2: bus 1 nominal bitrate
+  uint32_t reserved;  // v1: reserved; v2: bus 1 data bitrate (0 = classic)
 };
 
 struct Record {
   uint64_t ts_us;     // microseconds since capture epoch
   uint32_t id;        // bits0-28 = CAN id; bit31 = extended; bit30 = RTR; bit29 = meta
-  uint8_t dlc;        // data frame: 0..8 ; meta record: event code (see EventCode)
-  uint8_t flags;      // bit0 = gap_before (frames lost to overrun before this one)
-  uint8_t bus;        // 0 = primary channel (room for a 2nd controller later)
-  uint8_t reserved;
+  uint8_t dlc;        // data frame: data bytes (0..8 classic, 0..64 FD); meta: event code
+  uint8_t flags;      // REC_FLAG_* below
+  uint8_t bus;        // 0 = on-chip TWAI (Port A), 1 = FD adapter (fd_channel)
+  uint8_t cont;       // continuation records that follow (FD payloads over 8 bytes)
   uint8_t data[8];    // unused bytes zero
 };
 #pragma pack(pop)
@@ -67,7 +79,10 @@ static_assert(sizeof(FileHeader) == 32, "FileHeader must be 32 bytes");
 static_assert(sizeof(Record) == 24, "Record must be 24 bytes");
 
 static const uint32_t REC_META = 1u << 29;  // id bit marking a meta/event record
-static const uint8_t REC_FLAG_GAP = 1u << 0;
+static const uint8_t REC_FLAG_GAP = 1u << 0;  // frames on this bus were lost before this one
+static const uint8_t REC_FLAG_FDF = 1u << 1;  // CAN FD frame
+static const uint8_t REC_FLAG_BRS = 1u << 2;  // bit rate switch
+static const uint8_t REC_FLAG_ESI = 1u << 3;  // error state indicator
 
 enum EventCode : uint8_t {
   EV_CAPTURE_START = 1,  // reserved, not written yet
@@ -101,6 +116,14 @@ class CanLogger : public Component {
     sd_clk_ = clk; sd_cmd_ = cmd; sd_d0_ = d0; sd_d1_ = d1; sd_d2_ = d2; sd_d3_ = d3;
   }
   void set_sd_ldo_channel(int ch) { sd_ldo_chan_ = ch; }
+#ifdef USE_CAN_LOGGER_GSUSB
+  void set_fd_gs_usb(uint32_t nominal, uint32_t data, float sp_nominal, float sp_data,
+                     uint32_t test_frames) {
+    gs_usb_.set_bitrates(nominal, data);
+    gs_usb_.set_sample_points(sp_nominal, sp_data);
+    gs_usb_.set_test_frames(test_frames);
+  }
+#endif
 #ifdef USE_CAN_LOGGER_WEB
   // Called from codegen, before web_server's setup adds its own handler.
   void set_web_server_base(web_server_base::WebServerBase *base) {
@@ -119,7 +142,8 @@ class CanLogger : public Component {
   uint64_t overrun_total() const { return overrun_total_.load(); }
   uint64_t bytes_written() const { return bytes_written_.load(); }
   bool sd_ok() const { return sd_ok_.load(); }
-  bool capture_valid() const { return overrun_total_.load() == 0; }  // integrity gate
+  // integrity gate: nothing lost on either channel
+  bool capture_valid() const { return overrun_total_.load() == 0 && fd_overruns() == 0; }
   uint32_t bus_errors() const { return bus_errors_.load(); }  // diagnostic only
   // Live rate over the last second, updated in loop() (read from ESPHome's loop only).
   // Bus load counts nominal frame bits without stuff bits, so it reads a little low.
@@ -148,6 +172,19 @@ class CanLogger : public Component {
   std::string segment_name() const;
   float segment_mb() const { return seg_cur_bytes_.load() / 1048576.0f; }
 
+  // --- second (FD) channel; zero / "off" when built without fd_channel ---
+  bool fd_enabled() const;
+  uint64_t fd_frames_total() const { return fd_frames_total_.load(); }
+  float fd_frame_rate() const { return fd_rate_; }
+  float fd_peak_frame_rate() const { return fd_peak_rate_; }
+  float fd_bus_load_pct() const;     // the adapter's own measurement
+  // loss events: the adapter or the staging ring dropped frames (each event is
+  // one or more frames), plus PSRAM-ring overflows of FD frames
+  uint32_t fd_overruns() const;
+  const char *fd_state() const;      // "off", "no adapter", "active", ...
+  std::string fd_adapter() const;    // adapter board and firmware
+  uint32_t fd_staging_peak() const;
+
   // --- controls ---
   void start_capture();   // arm/begin free-run (also called from setup)
   void stop_capture();
@@ -165,6 +202,7 @@ class CanLogger : public Component {
  protected:
   // ring helpers (single-producer capture_task / single-consumer writer_task)
   bool ring_push_(const Record &r);          // producer
+  bool ring_push_n_(const Record *r, uint32_t n);  // producer: all n or none
   bool ring_pop_(Record &out);               // consumer
   void writer_handle_record_(const Record &r);
   void open_segment_();
@@ -263,6 +301,17 @@ class CanLogger : public Component {
   // producer-side pending gap flag (set when frames were lost)
   std::atomic<bool> gap_pending_{false};
   std::atomic<uint32_t> gap_lost_est_{0};
+
+  // second channel (capture task counts, loop computes the rate)
+  std::atomic<uint64_t> fd_frames_total_{0};
+  std::atomic<uint32_t> fd_ring_overruns_{0};  // PSRAM ring full for an FD frame
+  bool fd_gap_pending_{false};                 // capture task only
+  uint64_t fd_rate_frames_{0};
+  float fd_rate_{0}, fd_peak_rate_{0};
+#ifdef USE_CAN_LOGGER_GSUSB
+  GsUsbFd gs_usb_;
+  void drain_fd_(bool &got);       // capture task: FD staging -> PSRAM ring
+#endif
 
   uint64_t epoch_us_{0};
 };

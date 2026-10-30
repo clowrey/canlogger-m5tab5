@@ -32,7 +32,9 @@ What it does:
   sync, heap/PSRAM free, main-loop time, uptime and last reset reason.
 - Battery (from the Tab5's INA226): voltage, current, power and an estimated
   level, in HA, top right on the screen and on the details page. With no
-  battery fitted the screen says so and the level is unknown.
+  battery fitted the screen says so and the level is unknown, but only on a weak
+  supply (the monitor reads ~2 V): on a stronger 5 V supply it read 8.37 V with
+  no battery, probably the charger's float voltage, and shows a level near 100 %.
 - Device page with login (ESPHome `web_server`), capture list at `/files`,
   downloads at `/dl?f=<name>`. HA's device card links to it ("Visit").
 - Safe shutdown (HA button, or hold the middle button on screen for 4 s) closes the SD
@@ -68,7 +70,54 @@ docs/TESTING.md            desk test procedure and results
 | [M5 Unit CAN (CA-IS3050G)](https://shop.m5stack.com/products/canbus-unitca-is3050g) on **Port A** | Sold by M5 as "CANBus Unit (CA-IS3050G)", SKU U085. Yellow G53, white G54. `rx_pin: GPIO54`; if frames stay at 0 on a live bus, use `GPIO53`. No `tx_pin` is configured, so wiring it the other way round can't drive the bus. |
 | microSD card | FAT32. The component mounts it and never formats it. |
 | Separate 5 V supply | A PC USB port wasn't enough: Wi-Fi failed once the SD card was mounted. |
-| CANable 2.0 (optional) | Reference logger and desk test sender. Needs gs_usb firmware for listen-only; see [canable-fw](canable-fw/README.md). |
+| CANable 2.0 (optional) | Reference logger and desk test sender on a PC, or the **CAN FD channel** in the Tab5's USB-A port (below). Needs Elmue's CANable 2.5 firmware for listen-only and FD; see [canable-fw](canable-fw/README.md). |
+
+## Second channel: CAN FD on USB-A
+
+The P4's own controllers are classic CAN only. With `fd_channel:` in the
+`can_logger:` block, a CANable 2.0 (STM32G431) plugged into the Tab5's USB-A
+port becomes bus 1, logged into the same segment files:
+
+```yaml
+can_logger:
+  fd_channel:
+    driver: gs_usb
+    bitrate: 500000          # nominal
+    data_bitrate: 2000000    # FD data phase; 0 = classic CAN
+    # sample_point: 80%      data_sample_point: 75%   (defaults)
+```
+
+Leave the block out and the firmware is built exactly as the classic-only
+logger (no USB host, `CANBIN01` files). With it:
+
+- The ESP-IDF USB host runs in two tasks on core 1. The client opens the
+  CANable, sets it **listen-only** (FDCAN bus monitoring: it never ACKs), sets
+  both bit timings, and turns on 1 µs hardware timestamps and Elmue's blob
+  transfers, which pack several frames into one USB transfer.
+- Frames go into a 2,048-frame ring that the capture task drains into the
+  PSRAM ring as bus-1 records.
+- **Counted as FD overruns:** the CANable reporting that it dropped received
+  frames (each report is one or more frames), the ring filling up, and a
+  reconnect while capturing. Each one sets `GAP` on the next frame. Capture
+  valid needs both channels at 0.
+- The CANable's timestamps are mapped onto the Tab5's clock. The offset follows
+  the least-delayed USB transfer, and after the first 5 s it may only move by
+  200 µs a second.
+- **DFU recovery:** if the CANable comes up in its STM32 DFU bootloader (seen
+  when powered from the Tab5), the Tab5 sends the DFU "leave" request and its
+  firmware starts. Nothing is written.
+- The USB-A port's 5 V is switched by `pi4ioe2` P3 ("USB-A 5V Power" in the YAML).
+  With no battery fitted, the Tab5 powering the CANable from that port broke its
+  Wi-Fi (scans found nothing) on the desk. Powering the CANable from a separate
+  5 V supply with a USB splitter, with "USB-A 5V Power" off, fixed it.
+- Entities: FD frames captured, frame rate, bus load (the CANable's own
+  measurement), overruns, staging peak, bus state, adapter. The status screen
+  has an FD line.
+
+Unlike channel 0's IRAM interrupt, the USB stack runs in tasks and stops while
+the flash cache is off (OTA, settings saves). For that time only the CANable's
+70-frame queue holds frames, and a loss there is counted, not silent.
+`docs/CANFD-PLAN.md` has the comparison with an MCP2518FD on SPI.
 
 ## Build and flash
 
@@ -155,8 +204,21 @@ ESPHome loop (priority 1)
 
 32-byte `FileHeader` (`CANBIN01`, version, record size, bitrate, epoch), then
 fixed **24-byte records**: µs timestamp, id (bit 31 extended, bit 30 RTR,
-bit 29 meta), dlc, flags (bit 0 `GAP`: frames were lost before this one), 8 data
-bytes. The layout is defined in `can_logger.h` and mirrored by the scripts.
+bit 29 meta), dlc (data bytes), flags (bit 0 `GAP`: frames were lost before this
+one), bus, cont, 8 data bytes. The layout is defined in `can_logger.h` and read
+by `scripts/canbin.py`.
+
+With `fd_channel` the files are **`CANBIN02`**:
+- **Header:** its last two fields carry bus 1's nominal and data bitrates.
+- **Bus 1 flags:** FD frames set flags bit 1 (FDF), bit 2 (BRS) and bit 3 (ESI).
+- **Payloads over 8 bytes:** the head record holds the first 8 bytes, and `cont`
+  raw 24-byte records follow with the rest (one for up to 32 bytes, three for 64).
+- **Segment ends:** a segment never ends between a head record and its
+  continuations.
+
+`canbin2candump.py` writes bus 1 as `can1` in candump's FD syntax
+(`ID##<flags><data>`). Records are in arrival order, so sort by timestamp to
+merge the two buses.
 
 Files are `segNNNN.canbin`: everything, rotating at 64 MB (`seg_bytes`).
 Numbering continues from the highest file on the card, so a reboot never
@@ -173,7 +235,11 @@ Timestamps are µs since boot (no wall clock yet).
   power cut during a directory or FAT-table write can still corrupt a file. Use
   Safe shutdown. The card stays mounted on purpose: unmounting would deinit the
   SDMMC host the C6 Wi-Fi shares.
-- **Classic CAN only:** the P4's TWAI controllers don't do CAN FD.
+- **CAN FD only on the second channel:** the P4's TWAI controllers are classic
+  CAN only; FD needs the CANable on USB-A (`fd_channel`).
+- **Main task stack:** the component sets the IDF main-task stack to 9 KB. With
+  the FD build, the P4 heap put the default 3.5 KB stack in its 8 KB SPM, and
+  ESPHome's first flash access then asserted and boot-looped the board.
 - **SD space:** a busy bus fills a card fast (~190 MB/hour at 2,300 frames/s).
   Nothing is deleted automatically, and once the card is full, writes fail
   without counting as overruns: keep an eye on **SD free**.

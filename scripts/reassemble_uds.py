@@ -11,39 +11,27 @@ What it reports:
   * RequestDownload (0x34): dataFormatId, address, uncompressed size
   * each TransferData (0x36) block seq + length
   * RequestTransferExit (0x37)
-This is a first-cut reassembler: it assumes classic 11/29-bit ISO-TP, normal
-addressing, and that the tester's requests are on a single id. Set --tx-id to
-the tester->ECU id of the diag channel you captured. Validate the result's size
+This is a first-cut reassembler: it assumes normal-addressing ISO-TP (classic,
+or CAN FD with up to 64-byte frames) and that the tester's requests are on a
+single id. Set --tx-id to the tester->ECU id of the diag channel you captured,
+and --bus if the same id exists on both channels. Validate the result's size
 against the 0x34 announced size and the image's own header/CRC before trusting it.
 """
 import argparse
-import struct
 import sys
 
-HDR = struct.Struct("<8sHHIQII")
-REC = struct.Struct("<QIBBBB8s")
-META = 1 << 29
+import canbin
 
 
-def frames(path, want_id):
+def frames(path, want_id, bus=None):
     """Yield (ts_us, data_bytes) for data frames on want_id (None = any)."""
-    with open(path, "rb") as f:
-        hdr = f.read(HDR.size)
-        if len(hdr) < HDR.size:
-            sys.exit(f"{path}: only {len(hdr)} bytes, no CANBIN01 header")
-        magic, ver, rec_size, *_ = HDR.unpack(hdr)
-        if magic != b"CANBIN01":
-            sys.exit("not a CANBIN01 file")
-        while True:
-            raw = f.read(REC.size)
-            if len(raw) < REC.size:
-                break
-            ts_us, idf, dlc, flags, bus, _r, data = REC.unpack(raw)
-            if idf & META:
-                continue
-            cid = idf & 0x1FFFFFFF
-            if want_id is None or cid == want_id:
-                yield ts_us, data[:dlc]
+    it = canbin.read(path)
+    next(it)  # header
+    for fr in it:
+        if fr.meta or fr.rtr or (bus is not None and fr.bus != bus):
+            continue
+        if want_id is None or fr.id == want_id:
+            yield fr.ts_us, fr.data
 
 
 def isotp_messages(frame_iter):
@@ -57,7 +45,7 @@ def isotp_messages(frame_iter):
         pci = d[0] >> 4
         if pci == 0x0:  # single frame
             length = d[0] & 0x0F
-            if length == 0 and len(d) >= 2:  # escape (CAN FD) — not expected here
+            if length == 0 and len(d) >= 2:  # escape: CAN FD single frame over 8 bytes
                 length = d[1]
                 payload = d[2:2 + length]
             else:
@@ -66,7 +54,11 @@ def isotp_messages(frame_iter):
             assembling = False
         elif pci == 0x1:  # first frame
             length = ((d[0] & 0x0F) << 8) | d[1]
-            buf = bytearray(d[2:])
+            if length == 0 and len(d) >= 6:  # escape: 32-bit length (over 4095 bytes)
+                length = int.from_bytes(d[2:6], "big")
+                buf = bytearray(d[6:])
+            else:
+                buf = bytearray(d[2:])
             remaining = length - len(buf)
             assembling = True
         elif pci == 0x2:  # consecutive frame
@@ -87,6 +79,8 @@ def main():
     ap.add_argument("infile")
     ap.add_argument("--tx-id", type=lambda x: int(x, 0), required=True,
                     help="tester->ECU CAN id carrying 0x34/0x36 (e.g. 0x602)")
+    ap.add_argument("--bus", type=int, choices=(0, 1),
+                    help="only frames from this bus (0 = Port A, 1 = FD channel)")
     ap.add_argument("-o", "--out", default="image.bin")
     args = ap.parse_args()
 
@@ -95,7 +89,7 @@ def main():
     announced_size = None
     saw_exit = False
 
-    for msg in isotp_messages(frames(args.infile, args.tx_id)):
+    for msg in isotp_messages(frames(args.infile, args.tx_id, args.bus)):
         if not msg:
             continue
         svc = msg[0]

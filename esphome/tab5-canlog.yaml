@@ -141,6 +141,13 @@ can_logger:
   bitrate: 500000
   sd_path: /sdcard      # SDMMC slot 0, Tab5 pins/LDO are the component defaults
   ring_mb: 16           # of 32 MB PSRAM
+  # Second, CAN FD channel (bus 1): a CANable 2.0 with Elmue's CANable 2.5
+  # firmware plugged into the USB-A port, listen-only. Remove this block to
+  # build the classic-only logger (CANBIN01 files, no USB host).
+  fd_channel:
+    driver: gs_usb
+    bitrate: 500000         # arbitration / nominal
+    data_bitrate: 2000000   # FD data phase; 0 = classic CAN on this channel
 
 switch:
   # Power rails on the IO expanders. M5's Tab5 BSP turns WLAN_PWR_EN and EXT_5V
@@ -175,6 +182,16 @@ switch:
     pin:
       pi4ioe5v6408: pi4ioe2
       number: 7
+    restore_mode: ALWAYS_ON
+  # 5 V on the USB-A port, for the FD channel's CANable. Without a battery fitted,
+  # powering the CANable from here broke the Tab5's Wi-Fi on the desk; with the
+  # CANable on a powered splitter, set this ALWAYS_OFF so two supplies don't meet.
+  - platform: gpio
+    id: usb_5v_power
+    name: "USB-A 5V Power"
+    pin:
+      pi4ioe5v6408: pi4ioe2
+      number: 3
     restore_mode: ALWAYS_ON
   - platform: template
     name: "CAN capture armed"
@@ -293,6 +310,43 @@ sensor:
     accuracy_decimals: 1
     update_interval: 30s
     lambda: "return id(canlog).segment_mb();"
+  # second (FD) channel; these read 0 in a build without fd_channel
+  - platform: template
+    name: "FD frames captured"
+    unit_of_measurement: frames
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return (float) id(canlog).fd_frames_total();"
+  - platform: template
+    name: "FD overruns"           # loss events on the FD channel: must stay 0
+    unit_of_measurement: events
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return (float) id(canlog).fd_overruns();"
+  - platform: template
+    name: "FD frame rate"
+    unit_of_measurement: frames/s
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return id(canlog).fd_frame_rate();"
+  - platform: template
+    name: "FD bus load"           # measured by the adapter
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: "return id(canlog).fd_bus_load_pct();"
+  - platform: template
+    name: "FD staging peak"       # of the 2048-frame USB -> capture ring
+    unit_of_measurement: frames
+    state_class: measurement
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: "return id(canlog).fd_staging_peak();"
   - platform: uptime
     id: uptime_s
     name: "Uptime"
@@ -518,6 +572,15 @@ text_sensor:
     name: "Current segment"
     update_interval: 30s
     lambda: "return id(canlog).segment_name();"
+  - platform: template
+    name: "FD bus state"           # no adapter / active / warning / passive / bus-off
+    update_interval: 5s
+    lambda: "return std::string(id(canlog).fd_state());"
+  - platform: template
+    name: "FD adapter"             # board, MCU and firmware of the CANable
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: "return id(canlog).fd_adapter();"
   - platform: wifi_info
     ip_address:
       id: ip_addr
@@ -753,7 +816,7 @@ display:
       snprintf(b, sizeof(b), "%.0f%%", load);
       cell(390, "BUS LOAD", b, load < 70 ? fg : (load < 90 ? warn : bad));
       y += 160;
-      uint64_t ovr = id(canlog).overrun_total();
+      uint64_t ovr = id(canlog).overrun_total() + id(canlog).fd_overruns();  // both channels
       snprintf(b, sizeof(b), "%llu", (unsigned long long) ovr);
       cell(30, "OVERRUNS", b, ovr == 0 ? ok : bad);
       snprintf(b, sizeof(b), "%u", (unsigned) id(canlog).bus_errors());
@@ -763,15 +826,44 @@ display:
       cell(30, "WRITTEN TO SD", b, fg);
       y += 160;
 
+      float free_gb = id(canlog).sd_free_gb();
+      if (id(canlog).fd_enabled()) {
+        // SD and free space on one line, then the segment, then the FD channel
+        if (id(canlog).sd_ok())
+          snprintf(b, sizeof(b), "SD  OK  %.1f GB free", free_gb);
+        else
+          snprintf(b, sizeof(b), "SD  NOT MOUNTED");
+        it.print(30, y, id(font_mid), !id(canlog).sd_ok() ? bad : (free_gb > 1 ? ok : warn), b);
+        y += 70;
+        snprintf(b, sizeof(b), "%s  %.1f MB", id(canlog).segment_name().c_str(), id(canlog).segment_mb());
+        it.print(30, y, id(font_mid), fg, b);
+        y += 70;
+        const char *fs = id(canlog).fd_state();
+        uint32_t lost = id(canlog).fd_overruns();
+        bool up = !strcmp(fs, "active") || !strcmp(fs, "warning") || !strcmp(fs, "passive") || !strcmp(fs, "bus-off");
+        Color c = dim;
+        if (lost) {
+          snprintf(b, sizeof(b), "FD  LOST %u  %.0f/s", (unsigned) lost, id(canlog).fd_frame_rate());
+          c = bad;
+        } else if (up) {
+          snprintf(b, sizeof(b), "FD  %.0f/s  %.0f%%  %s", id(canlog).fd_frame_rate(),
+                   id(canlog).fd_bus_load_pct(), strcmp(fs, "active") ? fs : "OK");
+          c = !strcmp(fs, "active") ? ok : (!strcmp(fs, "warning") ? warn : bad);
+        } else {
+          snprintf(b, sizeof(b), "FD  %s", fs);
+          c = (!strcmp(fs, "failed") || !strcmp(fs, "disconnected")) ? warn : dim;
+        }
+        it.print(30, y, id(font_mid), c, b);
+      } else {
       it.print(30, y, id(font_mid), id(canlog).sd_ok() ? ok : bad,
                id(canlog).sd_ok() ? "SD  OK" : "SD  NOT MOUNTED");
       y += 70;
       snprintf(b, sizeof(b), "%s  %.1f MB", id(canlog).segment_name().c_str(), id(canlog).segment_mb());
       it.print(30, y, id(font_mid), fg, b);
       y += 70;
-      float free_gb = id(canlog).sd_free_gb();
       snprintf(b, sizeof(b), "%.1f GB free of %.1f", free_gb, id(canlog).sd_total_gb());
       it.print(30, y, id(font_small), free_gb > 1 ? dim : warn, b);
+      }
       }  // status page
 
       // bottom row, touch regions details_button / shutdown_button / settings_button (1100..1240)
