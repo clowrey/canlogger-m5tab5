@@ -1,8 +1,9 @@
 # Plan: a second, CAN FD channel
 
-Status (2026-10-29): **option B is built** (`fd_channel: driver: gs_usb`; see
-the README's "Second channel" section and docs/TESTING.md section 5). Option A
-is not started.
+Status (2026-11-02): **option B is built and tested with real FD frames** at 2
+and 5 Mbit/s on the desk (`fd_channel: driver: gs_usb`; see the README's "Second
+channel" section and docs/TESTING.md sections 5 and 6), not yet on a live FD bus.
+Option A is not started.
 
 Goal: log a CAN FD bus alongside the existing classic channel, both at full
 load, listen-only, with every lost frame counted, into the same capture files

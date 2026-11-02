@@ -67,3 +67,11 @@ Output: `Build/STM32G431_Candlelight_DykbNano/Candlelight2.5_DykbNano_STM32G431_
 Elmue's firmware can enter DFU by command (see its manual), so later updates
 don't need the BOOT button. `dfu-util -d 0483:df11 -a 0 -s 0x08000000:leave -D <file>.bin`
 works too. To go back, flash the backup the same way.
+
+An **MKS Makerbase V2.0 Pro** needs no patch: use Elmue's prebuilt
+`Candlelight2.5 - Multiboard - STM32G431.dfu` (from `Binary Files` in Elmue's
+repository, extracted to a .bin), flashed the same way. On that board
+`STM32_Programmer_CLI -c port=usb1 -g 0x08000000` started the firmware from DFU
+with no replug, but 2 of its 6 starts that way came up unhealthy
+([TESTING.md](../docs/TESTING.md), real CAN FD results). Replugging wasn't tried,
+and starting it the same way again fixed it.

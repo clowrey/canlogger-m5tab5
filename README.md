@@ -99,7 +99,8 @@ logger (no USB host, `CANBIN01` files). With it:
   PSRAM ring as bus-1 records.
 - **Counted as FD overruns:** the CANable reporting that it dropped received
   frames (each report is one or more frames), the ring filling up, and a
-  reconnect while capturing. Each one sets `GAP` on the next frame. Capture
+  reconnect while capturing. Each one sets `GAP` on the next frame, but the
+  CANable reports late: on the desk the flag landed 86 ms after the hole. Capture
   valid needs both channels at 0.
 - The CANable's timestamps are mapped onto the Tab5's clock, tracking both
   offset and rate: a CANable without a crystal measured about 0.1 % slow. Once a
@@ -199,6 +200,11 @@ ESPHome loop (priority 1)
 - Measured with 0 overruns (see docs/TESTING.md): ~7,700 frames/s at 100 % bus
   load (0-byte frames) on the desk for minutes, ~2,700 frames/s of 8-byte frames,
   and ~2,300 frames/s on a live vehicle bus.
+- FD channel, real FD frames from a second CANable on the desk, checked frame by
+  frame: 1,000,000 at 5 Mbit/s (~9,300 frames/s of every length up to 64 bytes,
+  5,274 frames/s of 64 bytes) and 450,000 at 2 Mbit/s, 0 overruns. One earlier
+  5 Mbit/s run lost 133 frames in one pause, which was counted. Not yet tried on a
+  live FD bus.
 
 ## Capture files (`.canbin`, little-endian)
 
@@ -236,7 +242,9 @@ Timestamps are µs since boot (no wall clock yet).
   Safe shutdown. The card stays mounted on purpose: unmounting would deinit the
   SDMMC host the C6 Wi-Fi shares.
 - **CAN FD only on the second channel:** the P4's TWAI controllers are classic
-  CAN only; FD needs the CANable on USB-A (`fd_channel`).
+  CAN only; FD needs the CANable on USB-A (`fd_channel`). On a bus carrying FD,
+  Port A misses classic frames that sit between FD frames and can, rarely, log a
+  false one, so use the FD channel's record there.
 - **Main task stack:** the component sets the IDF main-task stack to 9 KB. With
   the FD build, the P4 heap put the default 3.5 KB stack in its 8 KB SPM, and
   ESPHome's first flash access then asserted and boot-looped the board.

@@ -130,6 +130,33 @@ python scripts/canbin2candump.py seg0046.canbin --bus 1 -o fd.log
 Remove `test_loopback_frames` again for real use: it puts the CANable in
 loopback instead of listen-only.
 
+## 6. Real CAN FD on the wires
+
+This needs a second CANable with Elmue's firmware as the sender, on a PC and on
+the same two wires as the FD channel. The rates must match `fd_channel:`.
+
+```bash
+python scripts/canable_fd_testgen.py -n 300000 --fd-only -p fd1                # every length, 0-64 bytes
+python scripts/canable_fd_testgen.py -n 150000 --len 64 --start 1000000 -p fd2 # 64-byte frames
+python scripts/canable_fd_testgen.py -n 34000 --start 2000000 -p fd3           # every 17th frame classic, some RTR
+python tools/tab5_fetch.py <tab5-ip> seg -o captures
+python scripts/canbin2candump.py captures/segNNNN.canbin -o tab5.log
+python tools/compare_logs.py --iface can1 exact tab5.log fd1_sent.log fd2_sent.log fd3_sent.log
+```
+
+Pass when `exact` says IDENTICAL and FD overruns stay 0. Use `-d 5000000` for a
+5 Mbit/s build. `--no-brs` keeps FD frames at the nominal rate, `--classic` sends
+only classic frames, and `--gap-ms` paces them.
+
+In external loopback the sender reads its own frames back inside the chip, not
+from the wires, so its read-back says nothing about what's on the bus. Only the
+Tab5's capture does.
+
+If the sender says "no TX echo" while frames are still arriving at the Tab5, it
+is in the bad state described under the results. Restart it: send it DFU detach
+(class request 0 to interface 1, which Windows lets you do on this firmware), then
+run `STM32_Programmer_CLI -c port=usb1 -g 0x08000000`.
+
 ## Results
 
 Desk (2026-10-28, ESPHome 2026.7.2):
@@ -178,14 +205,32 @@ can't send FD:
 | Tab5 restart on the flooded bus | Files closed in 30 ms before the reboot. The FD channel starts ~1.5 s after Port A, then loses a few frames at start (8 fewer than Port A; a 2.7 ms hole), reported as 2 FD overruns with GAP flags; then second-by-second match |
 | OTA on the flooded bus | OTA completed and logging resumed. **The file ends about when the OTA starts**: the SD writer stops and was still stuck 6 s after the OTA finished ("files NOT closed"), so frames from the OTA's start until the reboot are lost, on both channels. Don't OTA during a capture |
 
-Not yet tested on the FD channel: real FD frames on the wires from another
-adapter (the Makerbase needs Elmue's firmware, which means pressing its BOOT
-button), 64-byte frames (the loopback sender now includes them), and a live FD
-bus.
+Real CAN FD on the wires (2026-11-02): an MKS Makerbase CANable (Elmue's
+Multiboard firmware) sending on a PC, with the FD channel's DYKB CANable and Port A
+listening on one desk bus, nominal 500 kbit/s. All with BRS unless stated; every
+result compared frame by frame with `exact` unless stated:
 
-Not yet tested: above ~65 % bus load (the CANable sends about 2,500-2,700
-frames/s at most; more than 32 frames in flight makes it drop its own read-back
-copies).
+| Test | Result |
+|---|---|
+| 2 Mbit/s: 300,000 frames of every length 0-64 bytes at 6,450 frames/s, then 150,000 of 64 bytes at 2,789 frames/s | 450,000 identical, 0 FD overruns, 0 GAP flags; buffer peak 1.8 %, staging peak 29 of 2,048 |
+| 5 Mbit/s: 800,000 of every length at ~9,300 frames/s, then 200,000 of 64 bytes at 5,274 frames/s | 1,000,000 identical, 0 FD overruns, 0 GAP flags; buffer peak 16.5 %, staging peak 41 |
+| 2 Mbit/s: 34,000 with every 17th classic (2,000 classic, 182 of them RTR) at 5,485 frames/s | 34,000 identical on the FD channel |
+| An earlier 5 Mbit/s run at ~9,300 frames/s | **One real loss:** 133 frames missing during a 13.5 ms silence, 20 s in; staging peak 93. Reported as 1 FD overrun and a GAP flag, but the flag landed 86 ms and 836 frames after the hole, since the CANable reports errors late. Cause of the pause not found; it didn't recur in the 1,000,000-frame run. This run also hit the sender fault in the next row, so it isn't in the identical totals above |
+| Sender faults, three times (two after starting the firmware, one mid-run after running well) | The Makerbase went bad: both Tab5 channels missed the same frames (59 of 458 classic; about 70 % of FD frames of 12-64 bytes at the nominal rate, nearly always the same ones on a repeat), then its USB read-back stopped. After restarting it, those frames all arrived. Frames that fail on the wire are **not** counted as FD overruns, because no valid frame reaches the CANable. Cause not found |
+| 960 fixed-pattern FD frames (0x00, 0xFF, 0x55, 0xAA, 0x0F, 0x01; 8-64 bytes; nominal rate and BRS) | All arrived |
+
+Port A on the same bus: it can't decode FD frames, and being listen-only it never
+disturbs the bus. With frames ~3 ms apart it logged all 100 classic frames among
+1,600 FD frames. Back to back it logged only 396 of 2,000 classic frames, all of
+them real and in order, with no overruns counted: a classic controller can't
+follow a bus like that. Over 1.5 million FD frames at 5 Mbit/s it logged 1 false
+classic frame (`13E#FD71DA277B`). So on a bus carrying FD, use the FD channel's
+record.
+
+Not yet tested on the FD channel: a live FD bus, and data rates above 5 Mbit/s.
+
+Not yet tested on Port A: 8-byte frames above ~65 % bus load (with 0-byte frames
+it held 100 %, above).
 
 ## The CANable as reference logger
 
