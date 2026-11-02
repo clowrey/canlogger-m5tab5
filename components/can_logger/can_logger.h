@@ -136,6 +136,7 @@ class CanLogger : public Component {
   void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::LATE; }
+  void on_safe_shutdown() override;  // restart / OTA: write out what's buffered first
 
   // --- stats exposed to ESPHome template entities (thread-safe reads) ---
   uint64_t frames_total() const { return frames_total_.load(); }

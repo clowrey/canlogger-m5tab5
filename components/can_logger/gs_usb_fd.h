@@ -131,13 +131,25 @@ class GsUsbFd {
   std::atomic<int64_t> busload_t_{0};
   int64_t last_string_log_{0};
 
-  // timestamp mapping: host = device (unwrapped) + offset; offset follows the
-  // smallest host-minus-device difference seen in each 1 s window
+  // Timestamp mapping: host = dev + offset + (dev - anchor) * drift, dev being the
+  // adapter's counter unwrapped. Boards without a crystal run about 0.1 % off, so
+  // the rate has to be tracked, not just the offset. Once a second the model is
+  // corrected from that window's best sample: the least-delayed frame or, on a
+  // quiet bus, the quickest read of the adapter's clock (sync_poll_).
   uint32_t last_dev_ts_{0};
   uint64_t dev_wrap_{0};
   bool have_offset_{false};
-  int64_t offset_{0}, win_min_{INT64_MAX}, win_t_{0}, first_t_{0};
+  int64_t offset_{0}, anchor_dev_{0};
+  float drift_{0};
+  uint8_t sync_updates_{0};
+  int64_t win_t_{0}, poll_t_{0};
+  int64_t win_min_{INT64_MAX}, win_dev_{0};    // frames in this window
+  int64_t poll_best_{0}, poll_dev_{0}, poll_rtt_{INT64_MAX};  // clock reads in this window
   uint64_t last_host_ts_{0};
+  void sync_reset_();
+  int64_t unwrap_(uint32_t dev_ts);
+  void sync_poll_(int64_t now);
+  void sync_tick_(int64_t now);
 
   // loopback test
   uint32_t test_sent_{0}, test_rx_{0}, test_seq_err_{0}, test_next_rx_{0};

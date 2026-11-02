@@ -1,4 +1,5 @@
 #include "can_logger.h"
+#include "esphome/core/application.h"
 #include "esphome/core/log.h"
 
 #include "esp_twai.h"
@@ -555,6 +556,21 @@ void CanLogger::writer_task() {
       vTaskDelay(pdMS_TO_TICKS(2));
     }
   }
+}
+
+// A restart or OTA would otherwise lose everything still in the PSRAM ring (OTA's
+// flash work starves the writer task, so that can be many seconds of frames) and
+// leave the segment file open. Same path as Safe shutdown, waited for here: the
+// writer can catch up at several MB/s, so 6 s covers the whole 16 MB ring.
+void CanLogger::on_safe_shutdown() {
+  safe_shutdown();
+  int64_t t0 = esp_timer_get_time();
+  while (!shutdown_done_.load() && esp_timer_get_time() - t0 < 6000000) {
+    App.feed_wdt();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  ESP_LOGI(TAG, "restart: files %s after %u ms", shutdown_done_.load() ? "closed" : "NOT closed",
+           (unsigned) ((esp_timer_get_time() - t0) / 1000));
 }
 
 void CanLogger::start_capture() {

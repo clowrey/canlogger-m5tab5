@@ -24,6 +24,7 @@ enum : uint8_t {
   REQ_SET_DEVICE_MODE = 2,
   REQ_GET_CAPABILITIES = 4,
   REQ_GET_DEVICE_VERSION = 5,
+  REQ_GET_TIMESTAMP = 6,        // the adapter's 1 us counter
   REQ_SET_BIT_TIMING_FD = 10,
   REQ_GET_CAPABILITIES_FD = 11,
   REQ_GET_BOARD_INFO = 20,
@@ -244,8 +245,13 @@ void GsUsbFd::client_task() {
       if (!open_device_(addr))
         close_device_();
     }
-    if (state_.load() == ST_RUNNING && test_frames_)
-      test_send_();
+    if (state_.load() == ST_RUNNING) {
+      int64_t now = esp_timer_get_time();
+      sync_poll_(now);
+      sync_tick_(now);
+      if (test_frames_)
+        test_send_();
+    }
   }
 }
 
@@ -396,16 +402,21 @@ bool GsUsbFd::open_device_(uint8_t addr) {
   if (!configure_())
     return false;
 
-  // stamps restart from the adapter's counter; re-learn the offset
-  have_offset_ = false;
-  win_min_ = INT64_MAX;
-  win_t_ = 0;
-  dev_wrap_ = 0;
-  last_dev_ts_ = 0;
-  if (was_running_)
-    gap_pending_ = true;  // reconnected while capturing: frames were missed
+  // stamps restart from the adapter's counter; re-learn the mapping
+  sync_reset_();
+  if (was_running_) {  // reconnected while capturing: frames may have been missed
+    gap_pending_ = true;
+    loss_events_.fetch_add(1);
+  }
+  // Reads queued first: on a busy bus the adapter's queue fills within
+  // milliseconds of starting, faster than the control requests here finish.
   for (auto *x : in_xfer_)
     submit_in_(x);
+  DeviceMode start = {1, DEV_LISTEN_ONLY | DEV_TIMESTAMP | DEV_PROTOCOL_ELMUE | DEV_SEND_USB_BLOBS};
+  if (test_frames_)
+    start.flags |= DEV_LOOPBACK;  // with LISTEN_ONLY: internal loopback, nothing on the wires
+  if (!ctrl_(REQ_SET_DEVICE_MODE, false, &start, sizeof(start)))
+    return false;
   state_.store(ST_RUNNING);
   was_running_ = true;
   test_sent_ = test_rx_ = test_seq_err_ = test_next_rx_ = 0;
@@ -462,11 +473,6 @@ bool GsUsbFd::configure_() {
   uint8_t interval = 10;  // bus load report every 1 s
   ctrl_(REQ_SET_BUSLOAD_REPORT, false, &interval, 1);
 
-  DeviceMode start = {1, DEV_LISTEN_ONLY | DEV_TIMESTAMP | DEV_PROTOCOL_ELMUE | DEV_SEND_USB_BLOBS};
-  if (test_frames_)
-    start.flags |= DEV_LOOPBACK;  // with LISTEN_ONLY: internal loopback, nothing on the wires
-  if (!ctrl_(REQ_SET_DEVICE_MODE, false, &start, sizeof(start)))
-    return false;
   ESP_LOGI(TAG, "CANable %s: %s, %u/%u bit/s (clock %u Hz, nominal brp %u seg %u/%u, data brp %u seg %u/%u)",
            adapter_, test_frames_ ? "INTERNAL LOOPBACK TEST" : "listen-only", (unsigned) nominal_,
            (unsigned) data_, (unsigned) cap.fclk_can, (unsigned) nt.brp, (unsigned) nt.seg1,
@@ -526,12 +532,13 @@ void GsUsbFd::submit_in_(usb_transfer_t *x) {
 void GsUsbFd::in_cb_(usb_transfer_t *x) {
   GsUsbFd *self = (GsUsbFd *) x->context;
   self->inflight_--;
+  uint8_t st = self->state_.load();
+  bool up = (st == ST_RUNNING || st == ST_OPENING) && !self->dev_gone_;  // OPENING: being started
   if (x->status == USB_TRANSFER_STATUS_COMPLETED) {
     self->parse_(x->data_buffer, x->actual_num_bytes, esp_timer_get_time());
-    if (self->state_.load() == ST_RUNNING && !self->dev_gone_)
+    if (up)
       self->submit_in_(x);
-  } else if (x->status != USB_TRANSFER_STATUS_NO_DEVICE && x->status != USB_TRANSFER_STATUS_CANCELED &&
-             self->state_.load() == ST_RUNNING && !self->dev_gone_) {
+  } else if (x->status != USB_TRANSFER_STATUS_NO_DEVICE && x->status != USB_TRANSFER_STATUS_CANCELED && up) {
     ESP_LOGW(TAG, "bulk IN status %d", (int) x->status);
     self->submit_in_(x);
   }
@@ -642,36 +649,102 @@ void GsUsbFd::rx_frame_(const uint8_t *m, uint8_t size, int64_t now) {
   }
 }
 
-// The adapter's 32-bit 1 us counter (wraps after ~71 min), unwrapped and moved
-// onto esp_timer time. The offset is the smallest host-minus-device difference
-// seen (the least-delayed transfer); after the first 5 s it may only move
-// 200 us per second, so latency jitter can't shake it but crystal drift is followed.
-uint64_t GsUsbFd::map_ts_(uint32_t dev_ts, int64_t now) {
+void GsUsbFd::sync_reset_() {
+  have_offset_ = false;
+  dev_wrap_ = 0;
+  last_dev_ts_ = 0;
+  drift_ = 0;
+  sync_updates_ = 0;
+  win_t_ = poll_t_ = 0;
+  win_min_ = INT64_MAX;
+  poll_rtt_ = INT64_MAX;
+}
+
+// The adapter's 32-bit 1 us counter wraps after ~71 min.
+int64_t GsUsbFd::unwrap_(uint32_t dev_ts) {
   if (dev_ts < last_dev_ts_ && last_dev_ts_ - dev_ts > 0x80000000u)
     dev_wrap_ += 1ull << 32;
   last_dev_ts_ = dev_ts;
-  int64_t dev = (int64_t) (dev_wrap_ + dev_ts);
-  int64_t cand = now - dev;
+  return (int64_t) (dev_wrap_ + dev_ts);
+}
+
+uint64_t GsUsbFd::map_ts_(uint32_t dev_ts, int64_t now) {
+  int64_t dev = unwrap_(dev_ts);
+  int64_t cand = now - dev;  // true offset + this frame's delay
   if (!have_offset_) {
     have_offset_ = true;
     offset_ = cand;
-    win_t_ = first_t_ = now;
-  }
-  if (cand < win_min_)
-    win_min_ = cand;
-  if (now - win_t_ >= 1000000) {
-    int64_t step = win_min_ - offset_;
-    if (now - first_t_ > 5000000)
-      step = std::max<int64_t>(-200, std::min<int64_t>(200, step));
-    offset_ += step;
-    win_min_ = INT64_MAX;
+    anchor_dev_ = dev;
     win_t_ = now;
   }
-  uint64_t ts = (uint64_t) (dev + offset_);
+  if (cand < win_min_) {
+    win_min_ = cand;
+    win_dev_ = dev;
+  }
+  uint64_t ts = (uint64_t) (dev + offset_ + (int64_t) ((float) (dev - anchor_dev_) * drift_));
   if (ts < last_host_ts_)
     ts = last_host_ts_;  // keep the channel's own order
   last_host_ts_ = ts;
   return ts;
+}
+
+// A quiet bus gives no frames to measure against, so read the adapter's clock
+// five times a second; a control transfer takes a USB frame or two, and the
+// midpoint of the quickest read in a window is the best estimate.
+void GsUsbFd::sync_poll_(int64_t now) {
+  if (win_min_ != INT64_MAX || now - poll_t_ < 200000)
+    return;  // frames are doing the job
+  poll_t_ = now;
+  uint8_t b[4];
+  int64_t t0 = esp_timer_get_time();
+  if (!ctrl_raw_(0x80 | 0x40 | 0x01, REQ_GET_TIMESTAMP, 0, iface_, b, sizeof(b), 200))
+    return;
+  int64_t t1 = esp_timer_get_time();
+  if (t1 - t0 < poll_rtt_) {
+    poll_rtt_ = t1 - t0;
+    poll_dev_ = unwrap_(rd32(b));
+    poll_best_ = (t0 + t1) / 2 - poll_dev_;
+  }
+}
+
+// Once a second: correct the offset by half the error and the rate from what's
+// left. The first two corrections take the whole error, to lock on quickly.
+void GsUsbFd::sync_tick_(int64_t now) {
+  if (win_t_ == 0)
+    win_t_ = now;
+  if (now - win_t_ < 1000000)
+    return;
+  win_t_ = now;
+  bool frames = win_min_ != INT64_MAX;
+  if (!frames && poll_rtt_ == INT64_MAX)
+    return;
+  int64_t sample = frames ? win_min_ : poll_best_;
+  int64_t dev = frames ? win_dev_ : poll_dev_;
+  win_min_ = INT64_MAX;
+  poll_rtt_ = INT64_MAX;
+  if (!have_offset_) {
+    have_offset_ = true;
+    offset_ = sample;
+    anchor_dev_ = dev;
+    return;
+  }
+  int64_t dt = dev - anchor_dev_;
+  if (dt < 100000)
+    return;
+  int64_t predicted = offset_ + (int64_t) ((float) dt * drift_);
+  int64_t err = sample - predicted;
+  if (err > 100000 || err < -100000) {  // a jump, not drift: start again from here
+    offset_ = sample;
+    anchor_dev_ = dev;
+    return;
+  }
+  bool locking = sync_updates_ < 2;
+  float d = drift_ + (float) err / (float) dt * (locking ? 1.0f : 0.2f);
+  drift_ = std::max(-0.02f, std::min(0.02f, d));
+  offset_ = predicted + (locking ? err : err / 2);
+  anchor_dev_ = dev;
+  if (locking)
+    sync_updates_++;
 }
 
 // ---- loopback test sender ---------------------------------------------------

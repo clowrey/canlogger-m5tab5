@@ -38,7 +38,8 @@ What it does:
 - Device page with login (ESPHome `web_server`), capture list at `/files`,
   downloads at `/dl?f=<name>`. HA's device card links to it ("Visit").
 - Safe shutdown (HA button, or hold the middle button on screen for 4 s) closes the SD
-  files before power-off; RESTART on screen resumes logging.
+  files before power-off; RESTART on screen resumes logging. A restart or OTA does
+  the same flush first, so buffered frames reach the card.
 
 ## Home Assistant
 
@@ -100,9 +101,10 @@ logger (no USB host, `CANBIN01` files). With it:
   frames (each report is one or more frames), the ring filling up, and a
   reconnect while capturing. Each one sets `GAP` on the next frame. Capture
   valid needs both channels at 0.
-- The CANable's timestamps are mapped onto the Tab5's clock. The offset follows
-  the least-delayed USB transfer, and after the first 5 s it may only move by
-  200 µs a second.
+- The CANable's timestamps are mapped onto the Tab5's clock, tracking both
+  offset and rate: a CANable without a crystal measured about 0.1 % slow. Once a
+  second the mapping is corrected from the least-delayed USB transfer or, on a
+  quiet bus, from reading the CANable's clock.
 - **DFU recovery:** if the CANable comes up in its STM32 DFU bootloader (seen
   when powered from the Tab5), the Tab5 sends the DFU "leave" request and its
   firmware starts. Nothing is written.
@@ -194,11 +196,9 @@ ESPHome loop (priority 1)
 - The bus state comes from the driver's `on_state_change` callback, not
   `twai_node_get_info()`: with a listen-only node and no TX queue, the latter's
   status path asserts on a null queue.
-- Measured: up to ~2,700 frames/s on the desk (8-byte frames, ~60 % bus load)
-  and ~2,300 frames/s on a live vehicle bus, with 0 overruns (see
-  docs/TESTING.md). The buffers (2,048 frames in internal RAM, 16 MB in PSRAM,
-  about 100 KB/s to SD at full load) leave room for more; not yet tested above
-  ~2,800 frames/s.
+- Measured with 0 overruns (see docs/TESTING.md): ~7,700 frames/s at 100 % bus
+  load (0-byte frames) on the desk for minutes, ~2,700 frames/s of 8-byte frames,
+  and ~2,300 frames/s on a live vehicle bus.
 
 ## Capture files (`.canbin`, little-endian)
 
@@ -240,6 +240,11 @@ Timestamps are µs since boot (no wall clock yet).
 - **Main task stack:** the component sets the IDF main-task stack to 9 KB. With
   the FD build, the P4 heap put the default 3.5 KB stack in its 8 KB SPM, and
   ESPHome's first flash access then asserted and boot-looped the board.
+- **Don't OTA during a capture:** the SD writer stops when the OTA starts, so the
+  frames from then until the reboot don't reach the card (both channels).
+- **Downloads slow SD writes:** Wi-Fi and the SD card share one SDMMC host. A 38 MB
+  download at full load on both channels pushed the PSRAM ring to 27 %, with 0
+  overruns.
 - **SD space:** a busy bus fills a card fast (~190 MB/hour at 2,300 frames/s).
   Nothing is deleted automatically, and once the card is full, writes fail
   without counting as overruns: keep an eye on **SD free**.

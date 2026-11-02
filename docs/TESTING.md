@@ -163,8 +163,25 @@ firmware on USB-A, 500 kbit/s / 2 Mbit/s):
 |---|---|
 | 200,000 numbered frames through internal loopback, 4-48 bytes (the first test build's pattern skipped 64) plus classic 8-byte, std and ext ids | Sent 200,000, received 200,000, 0 sequence errors, ~6,466 frames/s at the USB side. In the segment (`CANBIN02`, fetched with resume): all 200,000 on bus 1, in order, payloads, flags and ids correct, 0 GAP flags, 6,652 frames/s by timestamp. FD overruns 0, FD staging peak 24 of 2,048 |
 
-Not yet tested on the FD channel: 64-byte frames (the sender now includes them),
-a live FD bus, and a flash write (OTA, settings save) during FD capture.
+Both channels on real wires (2026-10-31): the FD channel's CANable and Port A on
+one bus, with a second CANable (MKS Makerbase, budgetcan firmware) as sender. Its
+firmware got stuck resending one queued 0-byte classic frame, holding the bus at
+100 %, about 7,714 frames/s. These are classic frames, because that firmware
+can't send FD:
+
+| Test | Result |
+|---|---|
+| 100 s at full load | 771,913 frames on each channel (788,207 in the segment, with an earlier 2 s burst), identical; 0 overruns, 0 GAP flags; buffer peak 2.5 %, staging peaks 26 and 28 of 2,048 |
+| 150 s at full load, screen brightness changed and held across two preference saves, one segment rotation | 1,157,864 more frames, totals identical on both channels; 0 overruns |
+| 110 s at full load while downloading a 38 MB file over Wi-Fi | 849,131 frames, totals identical; 0 overruns. Buffer peak 26.8 % (Wi-Fi and SD share one SDMMC host, so the download slows SD writes); the web server answered nothing else meanwhile; download not finished after ~90 s |
+| Timestamps, bus 1 against bus 0 | Median 69 µs, always within about ±1 ms over 197 s including a 95 s idle gap. The first firmware drifted 950 µs/s (this CANable's clock is 0.095 % slow) until rate tracking was added |
+| Tab5 restart on the flooded bus | Files closed in 30 ms before the reboot. The FD channel starts ~1.5 s after Port A, then loses a few frames at start (8 fewer than Port A; a 2.7 ms hole), reported as 2 FD overruns with GAP flags; then second-by-second match |
+| OTA on the flooded bus | OTA completed and logging resumed. **The file ends about when the OTA starts**: the SD writer stops and was still stuck 6 s after the OTA finished ("files NOT closed"), so frames from the OTA's start until the reboot are lost, on both channels. Don't OTA during a capture |
+
+Not yet tested on the FD channel: real FD frames on the wires from another
+adapter (the Makerbase needs Elmue's firmware, which means pressing its BOOT
+button), 64-byte frames (the loopback sender now includes them), and a live FD
+bus.
 
 Not yet tested: above ~65 % bus load (the CANable sends about 2,500-2,700
 frames/s at most; more than 32 frames in flight makes it drop its own read-back
